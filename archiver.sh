@@ -2647,7 +2647,7 @@ cmd_update_check() {
     echo
     echo "Automatic update checking is not yet configured."
     echo "To check for updates manually, visit the project repository:"
-    echo "  https://github.com/yourname/archiver/releases"
+    echo "  https://github.com/s7net/archiver/releases"
     echo
     echo "(Future versions will query the GitHub Releases API automatically.)"
 }
