@@ -1,5 +1,7 @@
 # Archiver
 
+<img width="1024" height="572" alt="image" src="https://github.com/user-attachments/assets/024dc7e4-9f7a-4331-8524-47db739a6861" />
+
 A production-grade backup tool for Linux, cPanel, and DirectAdmin servers.
 Pure Bash 4+ — no dependencies on `jq`, `python`, or `node`.
 
