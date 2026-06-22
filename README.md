@@ -11,34 +11,26 @@ retention policies, and cron scheduling.
 
 ## Installation
 
-Run the one-liner below. If Archiver is already installed, it will ask whether you want to update.
+Run this single command to install or update Archiver:
 
 ```bash
-FILE=~/bin/archiver
-if [ -f "$FILE" ]; then
-    read -rp "Archiver already installed. Update? [y/N]: " c
-    [[ "$c" =~ ^[Yy]$ ]] || { echo "Cancelled."; exit 0; }
-fi
-mkdir -p ~/bin
-curl -fsSL https://raw.githubusercontent.com/s7net/archiver/refs/heads/main/archiver.sh \
-    -o "$FILE" && chmod +x "$FILE" \
-    && echo "Done: $FILE"
+bash <(curl -fsSL https://raw.githubusercontent.com/s7net/archiver/refs/heads/main/install.sh)
 ```
 
-> **Note:** The script is installed to `~/bin/archiver`, which works in jailed shell environments
-> (cPanel, DirectAdmin) without requiring root access.
+That's it. The installer will:
+- Detect your privilege level (root → `/usr/local/bin`, otherwise → `~/bin`)
+- Ask before overwriting an existing installation
+- Add `~/bin` to your `PATH` automatically if needed
+- Check all required and optional dependencies
 
-### Make sure `~/bin` is in your PATH
+> Works in jailed shell environments (cPanel, DirectAdmin) without root access.
 
-If `archiver` is not found after installation, add this to your `~/.bashrc` or `~/.profile`:
+### If `archiver` is not found after install
+
+Add this to your `~/.bashrc` or `~/.profile` and reload:
 
 ```bash
 export PATH="$HOME/bin:$PATH"
-```
-
-Then reload it:
-
-```bash
 source ~/.bashrc
 ```
 
