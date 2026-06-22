@@ -14,7 +14,7 @@ retention policies, and cron scheduling.
 Run this single command to install or update Archiver:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/s7net/archiver/refs/heads/main/install.sh)
+curl -fsSL https://raw.githubusercontent.com/s7net/archiver/refs/heads/main/install.sh -o /tmp/archiver_install.sh && bash /tmp/archiver_install.sh && rm -f /tmp/archiver_install.sh
 ```
 
 That's it. The installer will:
