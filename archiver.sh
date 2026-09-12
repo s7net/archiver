@@ -129,6 +129,36 @@ check_deps
 #  UTILITY HELPERS
 # ============================================================
 
+trim() {
+    local val="$*"
+    val="${val#"${val%%[![:space:]]*}"}"
+    val="${val%"${val##*[![:space:]]}"}"
+    printf '%s' "$val"
+}
+
+# parse_host_port <input> [default_host] [default_port]
+# Outputs: host|port
+parse_host_port() {
+    local input="$1" default_host="${2:-localhost}" default_port="${3:-3306}"
+    input=$(trim "$input")
+    local host port
+    if [[ -z "$input" ]]; then
+        echo "${default_host}|${default_port}"
+        return
+    fi
+    if [[ "$input" =~ ^\[(.*)\]:([0-9]+)$ ]]; then
+        host="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[2]}"
+    elif [[ "$input" =~ ^([^:]+):([0-9]+)$ ]]; then
+        host="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[2]}"
+    else
+        host="$input"
+        port="$default_port"
+    fi
+    echo "${host}|${port}"
+}
+
 get_file_size() {
     local f="$1"
     [[ -e "$f" ]] || { echo 0; return; }
@@ -137,6 +167,7 @@ get_file_size() {
 
 human_size() {
     local bytes="$1"
+    [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
     if (( bytes >= 1073741824 )); then
         awk -v b="$bytes" 'BEGIN{printf "%.2fGB", b/1073741824}'
     elif (( bytes >= 1048576 )); then
@@ -185,12 +216,44 @@ _b64_encode() {
 }
 
 _b64_decode() {
-    base64 -d 2>/dev/null || base64 -D 2>/dev/null
+    local in
+    in=$(cat)
+    printf '%s' "$in" | base64 -d 2>/dev/null || printf '%s' "$in" | base64 -D 2>/dev/null || printf '%s' "$in"
 }
 
 cfg_validate_key() {
     local key="$1"
     [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]]
+}
+
+# cfg_normalize_key <key_or_alias> -> maps user-friendly names to canonical config keys
+cfg_normalize_key() {
+    local k="$1"
+    k=$(echo "$k" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9_' '_')
+    k="${k%_}"
+    case "$k" in
+        HOST|DATABASE_HOST) echo "DB_HOST" ;;
+        PORT|DATABASE_PORT) echo "DB_PORT" ;;
+        USER|USERNAME|DATABASE_USER) echo "DB_USER" ;;
+        PASS|PASSWORD|DATABASE_PASSWORD|DATABASE_PASS) echo "DB_PASS" ;;
+        NAME|DATABASE_NAME) echo "DB_NAME" ;;
+        TYPE|DATABASE_TYPE) echo "DB_TYPE" ;;
+        PATH|DIRECTORY|FILE_PATH|FILES_PATH) echo "FILES_PATH" ;;
+        EXCLUDE|EXCLUDES|EXCLUDE_PATTERNS) echo "EXCLUDE_PATTERNS" ;;
+        LABEL) echo "FILES_LABEL" ;;
+        KEEP_LOCAL|KEEPLOCAL) echo "KEEP_LOCAL" ;;
+        RETENTION|RETENTION_COUNT) echo "RETENTION_COUNT" ;;
+        COMPRESSION|COMPRESS) echo "COMPRESSION" ;;
+        ENCRYPTION|ENCRYPT) echo "ENCRYPTION" ;;
+        ENC_PASS|ENC_PASSWORD|ENCRYPTION_PASSWORD) echo "ENC_PASSWORD" ;;
+        TELEGRAM|TG) echo "TG_ENABLED" ;;
+        TELEGRAM_TOKEN|TG_TOKEN) echo "TG_TOKEN" ;;
+        TELEGRAM_CHAT|TELEGRAM_CHAT_ID|TG_CHAT|TG_CHAT_ID) echo "TG_CHAT_ID" ;;
+        TELEGRAM_TOPIC|TELEGRAM_TOPIC_ID|TG_TOPIC|TG_TOPIC_ID) echo "TG_TOPIC_ID" ;;
+        DISCORD|DC) echo "DC_ENABLED" ;;
+        DISCORD_URL|DISCORD_WEBHOOK|DC_URL|DC_WEBHOOK) echo "DC_URL" ;;
+        *) echo "$k" ;;
+    esac
 }
 
 # cfg_get <file> <key> [default]
@@ -208,13 +271,29 @@ cfg_get() {
         echo "$default"
         return
     fi
-    local decoded
-    decoded=$(printf '%s' "$val" | _b64_decode 2>/dev/null) || decoded=""
-    if [[ -z "$decoded" && -n "$val" ]]; then
-        # Fallback: not base64 (legacy/raw format) - return as-is
-        echo "$val"
-    else
+
+    # Check if this config file uses CONFIG_VERSION 2 (where values are base64 encoded)
+    local ver_line ver_val
+    ver_line=$(grep -m1 "^CONFIG_VERSION=" "$file" 2>/dev/null || true)
+    ver_val="${ver_line#*=}"
+
+    if [[ "$ver_val" == "Mg==" || "$ver_val" == "2" ]]; then
+        # v2 config: values are base64 encoded
+        local decoded
+        decoded=$(printf '%s' "$val" | _b64_decode)
         echo "$decoded"
+    else
+        # Legacy/plaintext format:
+        # If val is strictly valid base64 (length multiple of 4, valid chars) and decodes to printable text
+        if [[ "$val" =~ ^[A-Za-z0-9+/=]+$ ]] && (( ${#val} % 4 == 0 )) && [[ "$val" =~ [+=] || ${#val} -gt 16 ]]; then
+            local decoded
+            decoded=$(printf '%s' "$val" | _b64_decode)
+            if [[ -n "$decoded" ]] && ! LC_ALL=C grep -q '[^[:print:][:space:]]' <<< "$decoded"; then
+                echo "$decoded"
+                return
+            fi
+        fi
+        echo "$val"
     fi
 }
 
@@ -274,7 +353,7 @@ cfg_validate() {
             local dtype
             dtype=$(cfg_get "$file" DB_TYPE)
             case "$dtype" in
-                mysql|mariadb)
+                mysql|mariadb|postgres|postgresql)
                     local k
                     for k in DB_NAME DB_USER DB_HOST DB_PORT; do
                         if [[ -z "$(cfg_get "$file" "$k")" ]]; then
@@ -319,6 +398,33 @@ cfg_validate() {
             ;;
     esac
 
+    # Encryption validity check
+    if [[ "$(cfg_get "$file" ENCRYPTION)" == "true" ]]; then
+        if [[ -z "$(cfg_get "$file" ENC_PASSWORD)" ]]; then
+            echo "Missing ENC_PASSWORD (ENCRYPTION is true)"
+            (( errors++ )) || true
+        fi
+    fi
+
+    # Telegram notification validity check
+    if [[ "$(cfg_get "$file" TG_ENABLED)" == "true" ]]; then
+        local k
+        for k in TG_TOKEN TG_CHAT_ID; do
+            if [[ -z "$(cfg_get "$file" "$k")" ]]; then
+                echo "Missing $k (TG_ENABLED is true)"
+                (( errors++ )) || true
+            fi
+        done
+    fi
+
+    # Discord notification validity check
+    if [[ "$(cfg_get "$file" DC_ENABLED)" == "true" ]]; then
+        if [[ -z "$(cfg_get "$file" DC_URL)" ]]; then
+            echo "Missing DC_URL (DC_ENABLED is true)"
+            (( errors++ )) || true
+        fi
+    fi
+
     (( errors == 0 ))
 }
 
@@ -326,33 +432,61 @@ cfg_validate() {
 #  PROMPT HELPERS
 # ============================================================
 
-ask() {
-    local prompt="$1" default="${2:-}" input
-    if [[ -n "$default" ]]; then
-        IFS= read -r -p "$(echo -e "${CYAN}?${NC} ${prompt} [${default}]: ")" input </dev/tty
-        echo "${input:-$default}"
-    else
-        IFS= read -r -p "$(echo -e "${CYAN}?${NC} ${prompt}: ")" input </dev/tty
-        echo "$input"
+_read_line() {
+    local prompt="$1" secret="${2:-false}"
+    local input=""
+    local has_tty=false
+    if [[ -r /dev/tty && -w /dev/tty && -t 0 ]]; then
+        has_tty=true
     fi
+
+    if [[ "$has_tty" == "true" ]]; then
+        if [[ "$secret" == "true" ]]; then
+            IFS= read -r -s -p "$prompt" input </dev/tty
+            echo >/dev/tty
+        else
+            IFS= read -r -p "$prompt" input </dev/tty
+        fi
+    else
+        if [[ "$secret" == "true" ]]; then
+            IFS= read -r -s input || input=""
+        else
+            echo -ne "$prompt" >&2
+            IFS= read -r input || input=""
+        fi
+    fi
+    echo "$input"
+}
+
+ask() {
+    local prompt="$1" default="${2:-}" raw_input input
+    if [[ -n "$default" ]]; then
+        raw_input=$(_read_line "$(echo -e "${CYAN}?${NC} ${prompt} [${default}]: ")")
+    else
+        raw_input=$(_read_line "$(echo -e "${CYAN}?${NC} ${prompt}: ")")
+    fi
+    input=$(trim "$raw_input")
+    echo "${input:-$default}"
 }
 
 ask_optional() {
-    local prompt="$1" input
-    IFS= read -r -p "$(echo -e "${CYAN}?${NC} ${prompt} (Enter to skip): ")" input </dev/tty
+    local prompt="$1" raw_input input
+    raw_input=$(_read_line "$(echo -e "${CYAN}?${NC} ${prompt} (Enter to skip): ")")
+    input=$(trim "$raw_input")
     echo "$input"
 }
 
 ask_secret() {
-    local prompt="$1" input
-    IFS= read -r -s -p "$(echo -e "${CYAN}?${NC} ${prompt}: ")" input </dev/tty
-    echo >/dev/tty
+    local prompt="$1" raw_input input
+    raw_input=$(_read_line "$(echo -e "${CYAN}?${NC} ${prompt}: ")" true)
+    input=$(trim "$raw_input")
     echo "$input"
 }
 
 ask_yn() {
-    local prompt="$1" default="${2:-y}" input
-    IFS= read -r -p "$(echo -e "${CYAN}?${NC} ${prompt} [y/n] (${default}): ")" input </dev/tty
+    local prompt="$1" default="${2:-y}" raw_input input
+    raw_input=$(_read_line "$(echo -e "${CYAN}?${NC} ${prompt} [y/n] (${default}): ")")
+    input=$(trim "$raw_input")
     input="${input:-$default}"
     [[ "$input" =~ ^[Yy]$ ]]
 }
@@ -360,19 +494,34 @@ ask_yn() {
 ask_choice() {
     local prompt="$1"; shift
     local options=("$@")
-    echo -e "${CYAN}?${NC} $prompt" >/dev/tty
-    local i
-    for i in "${!options[@]}"; do
-        echo -e "  ${BOLD}$((i+1)))${NC} ${options[$i]}" >/dev/tty
-    done
+
+    if [[ -w /dev/tty ]]; then
+        echo -e "${CYAN}?${NC} $prompt" >/dev/tty
+        local i
+        for i in "${!options[@]}"; do
+            echo -e "  ${BOLD}$((i+1)))${NC} ${options[$i]}" >/dev/tty
+        done
+    else
+        echo -e "${CYAN}?${NC} $prompt" >&2
+        local i
+        for i in "${!options[@]}"; do
+            echo -e "  ${BOLD}$((i+1)))${NC} ${options[$i]}" >&2
+        done
+    fi
+
     local choice
     while true; do
-        IFS= read -r -p "  Enter number: " choice </dev/tty
+        choice=$(_read_line "  Enter number: ")
+        choice=$(trim "$choice")
         if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#options[@]} )); then
             echo "${options[$((choice-1))]}"
             return
         fi
-        echo -e "  ${RED}Invalid choice, try again.${NC}" >/dev/tty
+        if [[ -w /dev/tty ]]; then
+            echo -e "  ${RED}Invalid choice, try again.${NC}" >/dev/tty
+        else
+            echo -e "  ${RED}Invalid choice, try again.${NC}" >&2
+        fi
     done
 }
 
@@ -432,8 +581,11 @@ cleanup() {
     for p in "${CLEANUP_PATHS[@]:-}"; do
         [[ -n "$p" && -e "$p" ]] && rm -rf "$p" 2>/dev/null || true
     done
-    find "$BACKUP_TMP" -maxdepth 1 -name ".my_*.cnf" -type f -mmin +60 -exec rm -f {} + 2>/dev/null || true
+    find "$BACKUP_TMP" -maxdepth 1 -name ".my_*.cnf"  -type f -mmin +60 -exec rm -f {} + 2>/dev/null || true
+    find "$BACKUP_TMP" -maxdepth 1 -name ".pgpass_*"  -type f -mmin +60 -exec rm -f {} + 2>/dev/null || true
     find "$BACKUP_TMP" -maxdepth 1 -name "split_*"    -type d -mmin +60 -exec rm -rf {} + 2>/dev/null || true
+    find "$BACKUP_TMP" -maxdepth 1 -name "_dc_resp_*" -type f -mmin +60 -exec rm -f {} + 2>/dev/null || true
+    find "$BACKUP_TMP" -maxdepth 1 -name "_val_*"     -type f -mmin +60 -exec rm -f {} + 2>/dev/null || true
     find /tmp -maxdepth 1 -name "_archiver_resp_*" -type f -mmin +60 -exec rm -f {} + 2>/dev/null || true
     release_lock
 }
@@ -511,13 +663,13 @@ tar_verify() {
 # encrypt_file <infile> <outfile.enc> <password>
 encrypt_file() {
     local infile="$1" outfile="$2" password="$3"
-    openssl enc -aes-256-cbc -pbkdf2 -salt -in "$infile" -out "$outfile" -pass "pass:${password}" 2>/dev/null
+    ARCHIVER_ENC_PASS="$password" openssl enc -aes-256-cbc -pbkdf2 -salt -in "$infile" -out "$outfile" -pass env:ARCHIVER_ENC_PASS 2>/dev/null
 }
 
 # decrypt_file <infile.enc> <outfile> <password>
 decrypt_file() {
     local infile="$1" outfile="$2" password="$3"
-    openssl enc -aes-256-cbc -pbkdf2 -d -salt -in "$infile" -out "$outfile" -pass "pass:${password}" 2>/dev/null
+    ARCHIVER_ENC_PASS="$password" openssl enc -aes-256-cbc -pbkdf2 -d -salt -in "$infile" -out "$outfile" -pass env:ARCHIVER_ENC_PASS 2>/dev/null
 }
 
 # ============================================================
@@ -555,6 +707,8 @@ meta_record_success() {
     local total_runs total_success
     total_runs=$(cfg_get "$f" TOTAL_RUNS "0")
     total_success=$(cfg_get "$f" TOTAL_SUCCESS "0")
+    [[ "$total_runs" =~ ^[0-9]+$ ]] || total_runs=0
+    [[ "$total_success" =~ ^[0-9]+$ ]] || total_success=0
     cfg_set "$f" LAST_SUCCESS "$(date '+%Y-%m-%d %H:%M:%S')"
     cfg_set "$f" CONSEC_FAILURES "0"
     cfg_set "$f" TOTAL_RUNS "$(( total_runs + 1 ))"
@@ -568,6 +722,8 @@ meta_record_failure() {
     local total_runs consec
     total_runs=$(cfg_get "$f" TOTAL_RUNS "0")
     consec=$(cfg_get "$f" CONSEC_FAILURES "0")
+    [[ "$total_runs" =~ ^[0-9]+$ ]] || total_runs=0
+    [[ "$consec" =~ ^[0-9]+$ ]] || consec=0
     cfg_set "$f" LAST_FAILURE "$(date '+%Y-%m-%d %H:%M:%S')"
     cfg_set "$f" CONSEC_FAILURES "$(( consec + 1 ))"
     cfg_set "$f" TOTAL_RUNS "$(( total_runs + 1 ))"
@@ -704,7 +860,7 @@ send_telegram() {
 
 send_discord_file() {
     local file="$1" webhook="$2" content="$3"
-    local resp_file="/tmp/_archiver_resp_$$_$(random_id)"
+    local resp_file="$BACKUP_TMP/_dc_resp_$$_$(random_id)"
     local http_code
 
     http_code=$(curl --max-time 600 -s -o "$resp_file" -w "%{http_code}" \
@@ -798,13 +954,14 @@ dispatch_send() {
     local all_ok=true
     local any_enabled=false
 
-    local tg_enabled tg_token tg_chat tg_topic dc_enabled dc_url
+    local tg_enabled tg_token tg_chat tg_topic dc_enabled dc_url keep_local
     tg_enabled=$(cfg_get "$config" TG_ENABLED  "false")
     tg_token=$(cfg_get   "$config" TG_TOKEN    "")
     tg_chat=$(cfg_get    "$config" TG_CHAT_ID  "")
     tg_topic=$(cfg_get   "$config" TG_TOPIC_ID "")
     dc_enabled=$(cfg_get "$config" DC_ENABLED  "false")
     dc_url=$(cfg_get     "$config" DC_URL      "")
+    keep_local=$(cfg_get "$config" KEEP_LOCAL  "true")
 
     if [[ "$tg_enabled" == "true" ]]; then
         any_enabled=true
@@ -821,11 +978,51 @@ dispatch_send() {
     fi
 
     if [[ "$all_ok" == "true" ]]; then
-        log_info "All uploads confirmed. Removing local copy: $(basename "$file")"
-        rm -f "$file"
+        if [[ "$keep_local" == "true" ]]; then
+            log_info "All uploads confirmed. Local copy retained: $(basename "$file")"
+        else
+            log_info "All uploads confirmed. Removing local copy: $(basename "$file")"
+            rm -f "$file"
+        fi
     else
         log_error "One or more uploads failed. Local file KEPT: $file"
         return 1
+    fi
+}
+
+# notify_failure <config> <profile> <reason>
+notify_failure() {
+    local config="$1" profile="$2" reason="${3:-Backup failed}"
+    local host_name ts alert_msg
+    host_name=$(hostname 2>/dev/null || echo "server")
+    ts=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date)
+
+    local tg_enabled tg_token tg_chat tg_topic dc_enabled dc_url
+    tg_enabled=$(cfg_get "$config" TG_ENABLED  "false")
+    tg_token=$(cfg_get   "$config" TG_TOKEN    "")
+    tg_chat=$(cfg_get    "$config" TG_CHAT_ID  "")
+    tg_topic=$(cfg_get   "$config" TG_TOPIC_ID "")
+    dc_enabled=$(cfg_get "$config" DC_ENABLED  "false")
+    dc_url=$(cfg_get     "$config" DC_URL      "")
+
+    alert_msg="⚠️ [Archiver Alert] Backup failed!
+• Profile: ${profile}
+• Server: ${host_name}
+• Time: ${ts}
+• Reason: ${reason}"
+
+    if [[ "$tg_enabled" == "true" && -n "$tg_token" && -n "$tg_chat" ]]; then
+        local args=( -s --max-time 15 --data-urlencode "chat_id=${tg_chat}" --data-urlencode "text=${alert_msg}" )
+        [[ -n "$tg_topic" ]] && args+=( --data-urlencode "message_thread_id=${tg_topic}" )
+        curl "${args[@]}" "https://api.telegram.org/bot${tg_token}/sendMessage" >/dev/null 2>&1 || true
+    fi
+
+    if [[ "$dc_enabled" == "true" && -n "$dc_url" ]]; then
+        local escaped_msg="${alert_msg//\\/\\\\}"
+        escaped_msg="${escaped_msg//\"/\\\"}"
+        escaped_msg="${escaped_msg//$'\n'/\\n}"
+        curl -s --max-time 15 -H "Content-Type: application/json" \
+            -d "{\"content\": \"${escaped_msg}\"}" "$dc_url" >/dev/null 2>&1 || true
     fi
 }
 
@@ -860,6 +1057,11 @@ run_db_backup() {
     chmod 700 "$work_dir"
     register_cleanup "$work_dir"
 
+    local parsed_hp
+    parsed_hp=$(parse_host_port "$db_host" "localhost" "$db_port")
+    db_host="${parsed_hp%%|*}"
+    db_port="${parsed_hp##*|}"
+
     sql_file="$work_dir/${db_name}.sql"
     file_name="${profile}-${ts}.tar.gz"
     full_path="$BACKUP_OUT/$file_name"
@@ -873,17 +1075,30 @@ run_db_backup() {
     register_cleanup "$cnf"
     {
         echo "[client]"
-        echo "user=${db_user}"
-        echo "password=${db_pass}"
-        echo "host=${db_host}"
-        echo "port=${db_port}"
+        echo "user=\"${db_user//\"/\\\"}\""
+        echo "password=\"${db_pass//\"/\\\"}\""
+        echo "host=\"${db_host//\"/\\\"}\""
+        echo "port=\"${db_port//\"/\\\"}\""
+        if [[ "$db_host" == "localhost" && "$db_port" != "3306" ]]; then
+            echo "protocol=tcp"
+        fi
     } > "$cnf"
 
     local dump_ok=true
     mysqldump --defaults-extra-file="$cnf" \
-              --single-transaction \
+              --single-transaction --quick \
               --routines --triggers --events \
               "$db_name" > "$sql_file" 2>"$work_dir/mysqldump.err" || dump_ok=false
+
+    # If failed due to lack of EVENT privilege (common on cPanel / DirectAdmin), retry without --events
+    if [[ "$dump_ok" == "false" ]] && grep -qiE "(Access denied.*EVENT|SHOW EVENTS)" "$work_dir/mysqldump.err" 2>/dev/null; then
+        log_warn "User lacks EVENT privilege; retrying mysqldump without --events..."
+        dump_ok=true
+        mysqldump --defaults-extra-file="$cnf" \
+                  --single-transaction --quick \
+                  --routines --triggers \
+                  "$db_name" > "$sql_file" 2>"$work_dir/mysqldump.err" || dump_ok=false
+    fi
 
     rm -f "$cnf"
 
@@ -902,6 +1117,108 @@ run_db_backup() {
     fi
 
     write_metadata_file "$meta_file" "database ($db_type)" "$profile" "$db_name" "$comp" "$encrypt"
+
+    if ! tar_create "$full_path" "$comp" "$work_dir" "$(basename "$sql_file")" "backup-info.txt"; then
+        log_error "tar creation failed for $profile"
+        rm -rf "$work_dir"
+        return 1
+    fi
+    rm -rf "$work_dir"
+
+    if ! tar_verify "$full_path"; then
+        log_error "Archive integrity check FAILED for $full_path. Aborting upload."
+        return 1
+    fi
+    log_info "Integrity check OK: $file_name"
+
+    full_path=$(maybe_encrypt "$full_path" "$encrypt" "$enc_pass") || return 1
+
+    log_info "Archive ready: $(basename "$full_path") ($(human_size "$(get_file_size "$full_path")"))"
+
+    local result=0
+    dispatch_send "$full_path" "$config" || result=1
+
+    local retention
+    retention=$(cfg_get "$config" RETENTION_COUNT "0")
+    apply_retention "$profile" "$retention"
+
+    return $result
+}
+
+# ============================================================
+#  BACKUP: PostgreSQL
+# ============================================================
+
+run_postgres_backup() {
+    local config="$1" profile="$2"
+
+    if ! command -v pg_dump &>/dev/null; then
+        log_error "pg_dump not found. Cannot backup PostgreSQL database."
+        return 1
+    fi
+
+    local db_name db_type db_host db_port db_user db_pass comp encrypt enc_pass
+    db_name=$(cfg_get "$config" DB_NAME)
+    db_type=$(cfg_get "$config" DB_TYPE "postgres")
+    db_host=$(cfg_get "$config" DB_HOST "localhost")
+    db_port=$(cfg_get "$config" DB_PORT "5432")
+    db_user=$(cfg_get "$config" DB_USER)
+    db_pass=$(cfg_get "$config" DB_PASS)
+    comp=$(cfg_get "$config" COMPRESSION "normal")
+    encrypt=$(cfg_get "$config" ENCRYPTION "false")
+    enc_pass=$(cfg_get "$config" ENC_PASSWORD "")
+
+    local parsed_hp
+    parsed_hp=$(parse_host_port "$db_host" "localhost" "$db_port")
+    db_host="${parsed_hp%%|*}"
+    db_port="${parsed_hp##*|}"
+
+    local run_id ts sql_file work_dir file_name full_path meta_file pgpass
+    run_id="$$_$(random_id)"
+    ts=$(timestamp)
+    work_dir="$BACKUP_TMP/work_${run_id}"
+    mkdir -p "$work_dir"
+    chmod 700 "$work_dir"
+    register_cleanup "$work_dir"
+
+    sql_file="$work_dir/${db_name}.sql"
+    file_name="${profile}-${ts}.tar.gz"
+    full_path="$BACKUP_OUT/$file_name"
+    meta_file="$work_dir/backup-info.txt"
+
+    log_info "Dumping PostgreSQL: ${db_name} @ ${db_host}:${db_port}"
+
+    pgpass=$(mktemp "$BACKUP_TMP/.pgpass_XXXXXX")
+    chmod 600 "$pgpass"
+    register_cleanup "$pgpass"
+    echo "${db_host}:${db_port}:${db_name}:${db_user}:${db_pass}" > "$pgpass"
+
+    local dump_ok=true
+    PGPASSFILE="$pgpass" pg_dump \
+        -h "$db_host" \
+        -p "$db_port" \
+        -U "$db_user" \
+        -Fp \
+        --clean --if-exists \
+        "$db_name" > "$sql_file" 2>"$work_dir/pg_dump.err" || dump_ok=false
+
+    rm -f "$pgpass"
+
+    if [[ "$dump_ok" == "false" ]]; then
+        log_error "pg_dump failed for $db_name: $(tail -n1 "$work_dir/pg_dump.err" 2>/dev/null)"
+        rm -rf "$work_dir"
+        return 1
+    fi
+
+    local dump_size
+    dump_size=$(get_file_size "$sql_file")
+    if (( dump_size < 100 )); then
+        log_error "Dump file suspiciously small (${dump_size} bytes) - aborting"
+        rm -rf "$work_dir"
+        return 1
+    fi
+
+    write_metadata_file "$meta_file" "database (postgres)" "$profile" "$db_name" "$comp" "$encrypt"
 
     if ! tar_create "$full_path" "$comp" "$work_dir" "$(basename "$sql_file")" "backup-info.txt"; then
         log_error "tar creation failed for $profile"
@@ -1050,16 +1367,43 @@ run_files_backup() {
     src_base=$(basename "$src_path")
     level=$(compression_level "$comp")
 
-    if ! GZIP="$level" tar czf "$full_path" -C "$src_dir" "$src_base" -C "$work_dir" "backup-info.txt" 2>/dev/null; then
-        log_error "tar failed for $src_path"
+    local excludes
+    excludes=$(cfg_get "$config" EXCLUDE_PATTERNS "")
+    local exclude_args=()
+    if [[ -n "$excludes" ]]; then
+        local pattern
+        local IFS_SAVE="$IFS"
+        IFS=','
+        for pattern in $excludes; do
+            pattern=$(trim "$pattern")
+            if [[ -n "$pattern" ]]; then
+                exclude_args+=( --exclude="$pattern" )
+            fi
+        done
+        IFS="$IFS_SAVE"
+    fi
+
+    local tar_rc=0
+    if (( ${#exclude_args[@]} > 0 )); then
+        GZIP="$level" tar czf "$full_path" "${exclude_args[@]}" -C "$src_dir" "$src_base" -C "$work_dir" "backup-info.txt" 2>"$work_dir/tar.err" || tar_rc=$?
+    else
+        GZIP="$level" tar czf "$full_path" -C "$src_dir" "$src_base" -C "$work_dir" "backup-info.txt" 2>"$work_dir/tar.err" || tar_rc=$?
+    fi
+
+    # In GNU tar, exit code 1 means "file changed as we read it" (warning, not fatal)
+    if (( tar_rc > 1 )); then
+        log_error "tar failed for $src_path (exit $tar_rc): $(tail -n1 "$work_dir/tar.err" 2>/dev/null)"
         rm -rf "$work_dir"
         rm -f "$full_path"
         return 1
+    elif (( tar_rc == 1 )); then
+        log_warn "tar completed with warnings (some files changed during archive)"
     fi
     rm -rf "$work_dir"
 
     if ! tar_verify "$full_path"; then
         log_error "Archive integrity check FAILED for $full_path. Aborting upload."
+        rm -f "$full_path"
         return 1
     fi
     log_info "Integrity check OK: $file_name"
@@ -1118,6 +1462,45 @@ precheck_disk_space() {
         log_warn "[$profile] Could not determine free disk space"
         return 0
     fi
+
+    local btype
+    btype=$(cfg_get "$config" BACKUP_TYPE)
+    if [[ "$btype" == "files" ]]; then
+        local fpath
+        fpath=$(cfg_get "$config" FILES_PATH)
+        if [[ -e "$fpath" ]]; then
+            local src_kb
+            src_kb=$(du -sk "$fpath" 2>/dev/null | cut -f1)
+            if [[ "$src_kb" =~ ^[0-9]+$ ]] && (( src_kb > 0 )); then
+                local req_bytes=$(( (src_kb * 1024 * 11 / 10) + (min_free_mb * 1024 * 1024) ))
+                if (( free < req_bytes )); then
+                    log_error "[$profile] Insufficient disk space: estimated ~$(human_size "$req_bytes") needed, but only $(human_size "$free") free in $BACKUP_OUT"
+                    return 1
+                fi
+                return 0
+            fi
+        fi
+    elif [[ "$btype" == "database" ]]; then
+        local dtype
+        dtype=$(cfg_get "$config" DB_TYPE)
+        if [[ "$dtype" == "sqlite" ]]; then
+            local db_path
+            db_path=$(cfg_get "$config" DB_PATH)
+            if [[ -f "$db_path" ]]; then
+                local db_sz
+                db_sz=$(get_file_size "$db_path")
+                if (( db_sz > 0 )); then
+                    local req_bytes=$(( (db_sz * 11 / 10) + (min_free_mb * 1024 * 1024) ))
+                    if (( free < req_bytes )); then
+                        log_error "[$profile] Insufficient disk space for SQLite backup: estimated ~$(human_size "$req_bytes") needed, but only $(human_size "$free") free in $BACKUP_OUT"
+                        return 1
+                    fi
+                    return 0
+                fi
+            fi
+        fi
+    fi
+
     if (( free < min_free_mb * 1024 * 1024 )); then
         log_error "[$profile] Low disk space: only $(human_size "$free") free in $BACKUP_OUT"
         return 1
@@ -1171,9 +1554,15 @@ wizard_encryption() {
 
 wizard_retention() {
     local r
-    r=$(ask "Retention count (how many backups to keep, 0 = unlimited)" "10")
+    r=$(ask "Retention count (how many local backups to keep, 0 = unlimited)" "10")
     [[ "$r" =~ ^[0-9]+$ ]] || r=10
     RETENTION_W="$r"
+    KEEP_LOCAL_W="true"
+    if ask_yn "Keep local copy of backup after remote upload?" "y"; then
+        KEEP_LOCAL_W="true"
+    else
+        KEEP_LOCAL_W="false"
+    fi
 }
 
 wizard_schedule() {
@@ -1211,7 +1600,7 @@ cmd_add() {
     if [[ "$backup_type" == "Database" ]]; then
         echo -e "\n${BOLD}-- Database Settings -------------------------------------${NC}"
         local db_type
-        db_type=$(ask_choice "Database type?" "mysql" "mariadb" "sqlite")
+        db_type=$(ask_choice "Database type?" "mysql" "mariadb" "postgres" "sqlite")
 
         if [[ "$db_type" == "sqlite" ]]; then
             local db_path db_name
@@ -1230,6 +1619,7 @@ cmd_add() {
                 ENCRYPTION  "$ENCRYPTION_W" \
                 ENC_PASSWORD "$ENC_PASSWORD_W" \
                 RETENTION_COUNT "$RETENTION_W" \
+                KEEP_LOCAL  "$KEEP_LOCAL_W" \
                 TG_ENABLED  "$TG_ENABLED_W" \
                 TG_TOKEN    "$TG_TOKEN_W" \
                 TG_CHAT_ID  "$TG_CHAT_W" \
@@ -1237,11 +1627,26 @@ cmd_add() {
                 DC_ENABLED  "$DC_ENABLED_W" \
                 DC_URL      "$DC_URL_W"
         else
-            local db_host db_port db_name db_user db_pass
-            db_host=$(ask "Host" "localhost")
-            db_port=$(ask "Port" "3306")
+            local default_p="3306"
+            [[ "$db_type" == "postgres" || "$db_type" == "postgresql" ]] && default_p="5432"
+
+            local raw_host db_host db_port db_name db_user db_pass
+            raw_host=$(ask "Host (e.g. localhost or 127.0.0.1:${default_p})" "localhost")
+            local parsed_hp
+            parsed_hp=$(parse_host_port "$raw_host" "localhost" "$default_p")
+            db_host="${parsed_hp%%|*}"
+            local guessed_port="${parsed_hp##*|}"
+            db_port=$(ask "Port" "$guessed_port")
             db_name=$(ask "Database name")
-            db_user=$(ask "Username")
+
+            local default_u=""
+            [[ "$db_type" == "postgres" || "$db_type" == "postgresql" ]] && default_u="postgres"
+            if [[ -n "$default_u" ]]; then
+                db_user=$(ask "Username" "$default_u")
+            else
+                db_user=$(ask "Username")
+            fi
+
             db_pass=$(ask_secret "Password")
             profile="db_${db_name}"
             config_file="$CONFIGS_DIR/${profile}.conf"
@@ -1259,6 +1664,7 @@ cmd_add() {
                 ENCRYPTION  "$ENCRYPTION_W" \
                 ENC_PASSWORD "$ENC_PASSWORD_W" \
                 RETENTION_COUNT "$RETENTION_W" \
+                KEEP_LOCAL  "$KEEP_LOCAL_W" \
                 TG_ENABLED  "$TG_ENABLED_W" \
                 TG_TOKEN    "$TG_TOKEN_W" \
                 TG_CHAT_ID  "$TG_CHAT_W" \
@@ -1271,10 +1677,13 @@ cmd_add() {
         [[ "$backup_type" == "Single File" ]] && ftype="file"
 
         echo -e "\n${BOLD}-- ${backup_type} Settings -------------------------------${NC}"
-        local src_path label
+        local src_path label excludes=""
         src_path=$(ask "Source path")
         label=$(ask "Label" "$(basename "$src_path")")
         label=$(echo "$label" | tr -c 'A-Za-z0-9_.-' '_')
+        if [[ "$ftype" == "directory" ]]; then
+            excludes=$(ask "Exclude patterns (comma-separated, e.g. node_modules, .git, cache, *.log) [empty for none]")
+        fi
         profile="files_${label}"
         config_file="$CONFIGS_DIR/${profile}.conf"
 
@@ -1284,10 +1693,12 @@ cmd_add() {
             FILES_TYPE  "$ftype" \
             FILES_LABEL "$label" \
             FILES_PATH  "$src_path" \
+            EXCLUDE_PATTERNS "$excludes" \
             COMPRESSION "$COMPRESSION_W" \
             ENCRYPTION  "$ENCRYPTION_W" \
             ENC_PASSWORD "$ENC_PASSWORD_W" \
             RETENTION_COUNT "$RETENTION_W" \
+            KEEP_LOCAL  "$KEEP_LOCAL_W" \
             TG_ENABLED  "$TG_ENABLED_W" \
             TG_TOKEN    "$TG_TOKEN_W" \
             TG_CHAT_ID  "$TG_CHAT_W" \
@@ -1327,12 +1738,16 @@ cmd_edit() {
     echo
 
     while true; do
-        local key
-        key=$(ask_optional "Enter KEY to edit (or leave blank to finish)")
-        [[ -z "$key" ]] && break
+        local raw_key key
+        raw_key=$(ask_optional "Enter KEY to edit (or leave blank to finish)")
+        [[ -z "$raw_key" ]] && break
+        key=$(cfg_normalize_key "$raw_key")
         if ! cfg_validate_key "$key"; then
-            echo -e "${RED}Invalid key format. Use UPPER_SNAKE_CASE.${NC}"
+            echo -e "${RED}Invalid key format. Use UPPER_SNAKE_CASE (or friendly names like 'host', 'port', 'user').${NC}"
             continue
+        fi
+        if [[ "$key" != "$raw_key" ]]; then
+            echo -e "  (Editing canonical key: ${CYAN}${key}${NC})"
         fi
         local current
         current=$(cfg_get "$config_file" "$key")
@@ -1343,12 +1758,41 @@ cmd_edit() {
         echo "  Current value: ${masked:-<empty>}"
         local newval
         if [[ "$key" =~ (PASS|TOKEN|PASSWORD)$ ]]; then
-            newval=$(ask_secret "New value for $key")
+            newval=$(ask_secret "New value for $key (or 'clear' to empty)")
         else
-            newval=$(ask "New value for $key" "$current")
+            newval=$(ask "New value for $key (or 'clear' to empty)" "$current")
         fi
-        cfg_set "$config_file" "$key" "$newval"
-        echo -e "${GREEN}Updated $key${NC}"
+
+        if [[ "$newval" == "clear" || "$newval" == "none" ]]; then
+            cfg_set "$config_file" "$key" ""
+            echo -e "${GREEN}Cleared $key${NC}"
+        else
+            if [[ "$key" == "DB_HOST" ]]; then
+                local current_db_type
+                current_db_type="$(cfg_get "$config_file" DB_TYPE)"
+                local current_port
+                current_port="$(cfg_get "$config_file" DB_PORT)"
+                local default_p="3306"
+                if [[ "$current_db_type" == "postgres" || "$current_db_type" == "postgresql" ]]; then
+                    default_p="5432"
+                fi
+                [[ -n "$current_port" ]] && default_p="$current_port"
+                local parsed_hp
+                parsed_hp=$(parse_host_port "$newval" "localhost" "$default_p")
+                local h="${parsed_hp%%|*}"
+                local p="${parsed_hp##*|}"
+                cfg_set "$config_file" "DB_HOST" "$h"
+                if [[ "$p" != "$default_p" || -z "$current_port" ]]; then
+                    cfg_set "$config_file" "DB_PORT" "$p"
+                    echo -e "${GREEN}Updated DB_HOST to $h and DB_PORT to $p${NC}"
+                else
+                    echo -e "${GREEN}Updated DB_HOST to $h${NC}"
+                fi
+            else
+                cfg_set "$config_file" "$key" "$newval"
+                echo -e "${GREEN}Updated $key${NC}"
+            fi
+        fi
     done
 
     echo -e "${GREEN}Done editing ${profile}.${NC}"
@@ -1445,9 +1889,16 @@ cmd_list() {
         [[ "$enc" == "true" ]] && enc_str="${GREEN}ENC+${NC}" || enc_str="${RED}ENC-${NC}"
         [[ -n "$topic" ]]     && topic_str=" topic:${topic}"
 
+        local extra=""
+        if [[ "$btype" == "files" ]]; then
+            local ex
+            ex=$(cfg_get "$config" EXCLUDE_PATTERNS "")
+            [[ -n "$ex" ]] && extra="  excludes=${ex}"
+        fi
+
         echo -e "  ${CYAN}${name}${NC}"
         echo -e "     ${detail}${topic_str}"
-        echo -e "     compression=${comp}  retention=${retention}  [${tg_str} ${dc_str} ${enc_str}]"
+        echo -e "     compression=${comp}  retention=${retention}${extra}  [${tg_str} ${dc_str} ${enc_str}]"
     done
     echo
 }
@@ -1503,7 +1954,7 @@ cmd_run() {
 
         echo -e "${BOLD}--- [$profile] type=$btype ---${NC}"
 
-        local validate_tmp="/tmp/_archiver_validate_$$.tmp"
+        local validate_tmp="$BACKUP_TMP/_val_$$_$(random_id).tmp"
         if ! cfg_validate "$config" > "$validate_tmp" 2>&1; then
             log_error "[$profile] Config invalid:"
             sed 's/^/    /' "$validate_tmp"
@@ -1520,6 +1971,7 @@ cmd_run() {
 
         if ! precheck_disk_space "$config" "$profile"; then
             meta_record_failure "$profile"
+            notify_failure "$config" "$profile" "Insufficient disk space"
             failed=$(( failed + 1 ))
             continue
         fi
@@ -1530,8 +1982,9 @@ cmd_run() {
                 local dtype
                 dtype=$(cfg_get "$config" DB_TYPE)
                 case "$dtype" in
-                    mysql|mariadb) run_db_backup "$config" "$profile" || rc=1 ;;
-                    sqlite)        run_sqlite_backup "$config" "$profile" || rc=1 ;;
+                    mysql|mariadb)       run_db_backup "$config" "$profile" || rc=1 ;;
+                    postgres|postgresql) run_postgres_backup "$config" "$profile" || rc=1 ;;
+                    sqlite)              run_sqlite_backup "$config" "$profile" || rc=1 ;;
                     *) log_error "[$profile] Unknown DB type: $dtype"; rc=1 ;;
                 esac
                 ;;
@@ -1547,6 +2000,7 @@ cmd_run() {
             success=$(( success + 1 ))
         else
             meta_record_failure "$profile"
+            notify_failure "$config" "$profile" "Backup execution or upload failed"
             failed=$(( failed + 1 ))
         fi
     done
@@ -1585,6 +2039,9 @@ _dry_run_describe() {
             sz=$(du -sh "$fpath" 2>/dev/null | cut -f1)
             echo "    estimated size: ${sz:-unknown}"
         fi
+        local ex
+        ex=$(cfg_get "$config" EXCLUDE_PATTERNS "")
+        [[ -n "$ex" ]] && echo "    excludes: $ex"
     fi
 
     local tg dc
@@ -1628,7 +2085,7 @@ cmd_restore() {
 
     local choice=""
     while true; do
-        IFS= read -r -p "Select backup number (or q to quit): " choice </dev/tty
+        choice=$(_read_line "Select backup number (or q to quit)")
         [[ "$choice" == "q" ]] && return 0
         if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#archives[@]} )); then
             break
@@ -1714,7 +2171,15 @@ _restore_process() {
     while IFS= read -r f; do sqlite_files+=("$f"); done < <(ls -1 "$extract_dir"/*.sqlite 2>/dev/null || true)
 
     if [[ ${#sql_files[@]} -gt 0 && -f "${sql_files[0]}" ]]; then
-        _restore_mysql "${sql_files[0]}"
+        local is_postgres=false
+        if [[ -f "$extract_dir/backup-info.txt" ]] && grep -qiE "database \((postgres|postgresql)\)" "$extract_dir/backup-info.txt"; then
+            is_postgres=true
+        fi
+        if [[ "$is_postgres" == "true" ]]; then
+            _restore_postgres "${sql_files[0]}"
+        else
+            _restore_mysql "${sql_files[0]}"
+        fi
     elif [[ ${#sqlite_files[@]} -gt 0 && -f "${sqlite_files[0]}" ]]; then
         _restore_sqlite "${sqlite_files[0]}"
     else
@@ -1722,6 +2187,51 @@ _restore_process() {
     fi
 
     rm -rf "$work_dir"
+}
+
+_restore_postgres() {
+    local sql_file="$1"
+    echo
+    echo "This appears to be a PostgreSQL dump."
+    if ! ask_yn "Restore into a database now?" "n"; then
+        echo "You can manually restore with:"
+        echo "  psql -h HOST -p PORT -U USER -d DBNAME < '$sql_file'"
+        return 0
+    fi
+
+    if ! command -v psql &>/dev/null; then
+        log_error "psql client not found."
+        return 1
+    fi
+
+    local raw_host host port user pass dbname default_db
+    default_db="$(basename "$sql_file" .sql)"
+    raw_host=$(ask "Host (e.g. localhost or 127.0.0.1:5432)" "localhost")
+    local parsed_hp
+    parsed_hp=$(parse_host_port "$raw_host" "localhost" "5432")
+    host="${parsed_hp%%|*}"
+    local guessed_port="${parsed_hp##*|}"
+    port=$(ask "Port" "$guessed_port")
+    user=$(ask "Username" "postgres")
+    pass=$(ask_secret "Password")
+    dbname=$(ask "Target database name" "$default_db")
+
+    local pgpass
+    pgpass=$(mktemp "$BACKUP_TMP/.pgpass_XXXXXX")
+    chmod 600 "$pgpass"
+    register_cleanup "$pgpass"
+    local escaped_pass="${pass//\\/\\\\}"
+    escaped_pass="${escaped_pass//:/\\:}"
+    echo "${host}:${port}:${dbname}:${user}:${escaped_pass}" > "$pgpass"
+
+    if PGPASSFILE="$pgpass" psql -h "$host" -p "$port" -U "$user" -d "$dbname" < "$sql_file"; then
+        echo -e "${GREEN}Restore completed into '$dbname'.${NC}"
+    else
+        log_error "psql restore failed."
+        rm -f "$pgpass"
+        return 1
+    fi
+    rm -f "$pgpass"
 }
 
 _restore_mysql() {
@@ -1739,12 +2249,17 @@ _restore_mysql() {
         return 1
     fi
 
-    local host port user pass dbname
-    host=$(ask "Host" "localhost")
-    port=$(ask "Port" "3306")
+    local raw_host host port user pass dbname default_db
+    default_db="$(basename "$sql_file" .sql)"
+    raw_host=$(ask "Host (e.g. localhost or 127.0.0.1:3306)" "localhost")
+    local parsed_hp
+    parsed_hp=$(parse_host_port "$raw_host" "localhost" "3306")
+    host="${parsed_hp%%|*}"
+    local guessed_port="${parsed_hp##*|}"
+    port=$(ask "Port" "$guessed_port")
     user=$(ask "Username")
     pass=$(ask_secret "Password")
-    dbname=$(ask "Target database name")
+    dbname=$(ask "Target database name" "$default_db")
 
     local cnf
     cnf=$(mktemp "$BACKUP_TMP/.my_XXXXXX.cnf")
@@ -1752,10 +2267,13 @@ _restore_mysql() {
     register_cleanup "$cnf"
     {
         echo "[client]"
-        echo "user=$user"
-        echo "password=$pass"
-        echo "host=$host"
-        echo "port=$port"
+        echo "user=\"${user//\"/\\\"}\""
+        echo "password=\"${pass//\"/\\\"}\""
+        echo "host=\"${host//\"/\\\"}\""
+        echo "port=\"${port//\"/\\\"}\""
+        if [[ "$host" == "localhost" && "$port" != "3306" ]]; then
+            echo "protocol=tcp"
+        fi
     } > "$cnf"
 
     if mysql --defaults-extra-file="$cnf" "$dbname" < "$sql_file"; then
@@ -1772,8 +2290,12 @@ _restore_sqlite() {
     local sqlite_file="$1"
     echo
     echo "This appears to be a SQLite database."
+    local default_dest="$HOME/$(basename "$sqlite_file")"
     local dest
-    dest=$(ask "Restore to path")
+    dest=$(ask "Restore to path" "$default_dest")
+    [[ -z "$dest" ]] && dest="$default_dest"
+
+    mkdir -p "$(dirname "$dest")"
     if [[ -e "$dest" ]]; then
         if ! ask_yn "File '$dest' exists. Overwrite?" "n"; then
             echo "Cancelled."
@@ -1781,8 +2303,22 @@ _restore_sqlite() {
         fi
         cp "$dest" "${dest}.bak.$(timestamp)" 2>/dev/null || true
     fi
-    cp "$sqlite_file" "$dest"
-    echo -e "${GREEN}Restored SQLite database to: $dest${NC}"
+
+    if cp "$sqlite_file" "$dest"; then
+        echo -e "${GREEN}Restored SQLite database to: $dest${NC}"
+        if command -v sqlite3 &>/dev/null; then
+            local check
+            check=$(sqlite3 "$dest" "PRAGMA quick_check;" 2>&1 || echo "failed")
+            if [[ "$check" == "ok" ]]; then
+                echo -e "${GREEN}Integrity check passed (PRAGMA quick_check: ok)${NC}"
+            else
+                echo -e "${YELLOW}Warning: SQLite integrity check reported: $check${NC}"
+            fi
+        fi
+    else
+        log_error "Failed to copy SQLite database to: $dest"
+        return 1
+    fi
 }
 
 _restore_files() {
@@ -1793,13 +2329,22 @@ _restore_files() {
     dest=$(ask "Restore destination directory" "$HOME/archiver_restore_$(timestamp)")
     mkdir -p "$dest"
 
-    local item
+    shopt -s dotglob nullglob
+    local item cp_failed=0
     for item in "$extract_dir"/*; do
         [[ "$(basename "$item")" == "backup-info.txt" ]] && continue
-        cp -a "$item" "$dest/"
+        if ! cp -a "$item" "$dest/"; then
+            cp_failed=1
+        fi
     done
+    shopt -u dotglob nullglob
 
-    echo -e "${GREEN}Restored files to: $dest${NC}"
+    if (( cp_failed == 0 )); then
+        echo -e "${GREEN}Restored files to: $dest${NC}"
+    else
+        log_error "One or more files failed to restore to: $dest"
+        return 1
+    fi
 }
 
 # ============================================================
@@ -1841,8 +2386,16 @@ cron_install() {
         return 1
     fi
 
-    local script_path
-    script_path=$(readlink -f "$0" 2>/dev/null || echo "$0")
+    local script_path=""
+    if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+        script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/$(basename "${BASH_SOURCE[0]}")"
+    fi
+    if [[ -z "$script_path" || ! -x "$script_path" ]]; then
+        script_path=$(command -v archiver 2>/dev/null || which archiver 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")
+    fi
+    if [[ "$script_path" != /* ]]; then
+        script_path="$(pwd)/$script_path"
+    fi
 
     local run_arg=""
     [[ -n "$profile" ]] && run_arg=" $profile"
@@ -1852,7 +2405,7 @@ cron_install() {
     local current
     current=$(crontab -l 2>/dev/null || true)
 
-    local marker="${script_path} run${run_arg}"
+    local marker="run${run_arg}"
     if echo "$current" | grep -qF "$marker"; then
         log_warn "Cron entry for '${profile:-all profiles}' already exists. Skipping."
         return 0
@@ -1864,28 +2417,29 @@ cron_install() {
 
 cron_remove() {
     local profile="${1:-}"
-    local script_path
-    script_path=$(readlink -f "$0" 2>/dev/null || echo "$0")
-
     local current
     current=$(crontab -l 2>/dev/null || true)
     [[ -z "$current" ]] && { echo "No crontab entries."; return 0; }
 
-    local run_arg=""
-    [[ -n "$profile" ]] && run_arg=" $profile"
-    local marker="${script_path} run${run_arg}"
-
     local filtered
-    filtered=$(echo "$current" | grep -vF "$marker" || true)
-    echo "$filtered" | crontab -
-    log_info "Removed cron entries matching: $marker"
+    if [[ -n "$profile" ]]; then
+        filtered=$(echo "$current" | grep -vE "(archiver.*run ${profile}(\b|[[:space:]])|${CRON_TAG}.*${profile})" || true)
+    else
+        filtered=$(echo "$current" | grep -vE "(${CRON_TAG}|archiver.*run)" || true)
+    fi
+    echo "$filtered" | grep -v '^$' | crontab -
+    log_info "Removed cron entries for: ${profile:-all profiles}"
 }
 
 cron_show() {
-    local script_path
-    script_path=$(readlink -f "$0" 2>/dev/null || echo "$0")
     echo -e "${BOLD}Archiver-managed cron entries:${NC}"
-    crontab -l 2>/dev/null | grep -F "$script_path" || echo "  (none)"
+    local entries
+    entries=$(crontab -l 2>/dev/null | grep -E "(${CRON_TAG}|archiver.*run)" || true)
+    if [[ -n "$entries" ]]; then
+        echo "$entries"
+    else
+        echo "  (none)"
+    fi
 }
 
 cmd_cron() {
@@ -1944,7 +2498,7 @@ cmd_doctor() {
     done
 
     # Optional tools
-    for tool in openssl sqlite3 mysqldump mysql flock crontab; do
+    for tool in openssl sqlite3 mysqldump mysql pg_dump psql flock crontab; do
         if command -v "$tool" &>/dev/null; then
             _doctor_check "$tool" "PASS"
         else
@@ -2151,7 +2705,7 @@ doctor_check_discord() {
         return
     fi
 
-    local resp_file="/tmp/_archiver_resp_$$_$(random_id)"
+    local resp_file="$BACKUP_TMP/_dc_resp_$$_$(random_id)"
     local http_code
     http_code=$(curl --max-time 30 -s -o "$resp_file" -w "%{http_code}" "$webhook" 2>/dev/null)
     local body
@@ -2187,22 +2741,67 @@ doctor_check_db_connection() {
             db_pass=$(cfg_get "$config" DB_PASS)
             db_name=$(cfg_get "$config" DB_NAME)
 
+            local parsed_hp
+            parsed_hp=$(parse_host_port "$db_host" "localhost" "$db_port")
+            db_host="${parsed_hp%%|*}"
+            db_port="${parsed_hp##*|}"
+
             local cnf
             cnf=$(mktemp "$BACKUP_TMP/.my_XXXXXX.cnf")
             chmod 600 "$cnf"
             register_cleanup "$cnf"
             {
                 echo "[client]"
-                echo "user=${db_user}"
-                echo "password=${db_pass}"
-                echo "host=${db_host}"
-                echo "port=${db_port}"
+                echo "user=\"${db_user//\"/\\\"}\""
+                echo "password=\"${db_pass//\"/\\\"}\""
+                echo "host=\"${db_host//\"/\\\"}\""
+                echo "port=\"${db_port//\"/\\\"}\""
+                if [[ "$db_host" == "localhost" && "$db_port" != "3306" ]]; then
+                    echo "protocol=tcp"
+                fi
             } > "$cnf"
 
             local err_out
             err_out=$(mysql --defaults-extra-file="$cnf" -e "SELECT 1;" "$db_name" 2>&1 >/dev/null)
             local rc=$?
             rm -f "$cnf"
+
+            if (( rc == 0 )); then
+                _doctor_check "Database connection ($dtype)" "PASS" "(connected to '${db_name}' @ ${db_host}:${db_port})"
+            else
+                _doctor_check "Database connection ($dtype)" "FAIL" "($(echo "$err_out" | head -1))"
+            fi
+            ;;
+        postgres|postgresql)
+            if ! command -v psql &>/dev/null; then
+                _doctor_check "Database connection ($dtype)" "WARN" "(psql client not installed; cannot test)"
+                return
+            fi
+
+            local db_host db_port db_user db_pass db_name
+            db_host=$(cfg_get "$config" DB_HOST "localhost")
+            db_port=$(cfg_get "$config" DB_PORT "5432")
+            db_user=$(cfg_get "$config" DB_USER)
+            db_pass=$(cfg_get "$config" DB_PASS)
+            db_name=$(cfg_get "$config" DB_NAME)
+
+            local parsed_hp
+            parsed_hp=$(parse_host_port "$db_host" "localhost" "$db_port")
+            db_host="${parsed_hp%%|*}"
+            db_port="${parsed_hp##*|}"
+
+            local pgpass
+            pgpass=$(mktemp "$BACKUP_TMP/.pgpass_XXXXXX")
+            chmod 600 "$pgpass"
+            register_cleanup "$pgpass"
+            local escaped_pass="${db_pass//\\/\\\\}"
+            escaped_pass="${escaped_pass//:/\\:}"
+            echo "${db_host}:${db_port}:${db_name}:${db_user}:${escaped_pass}" > "$pgpass"
+
+            local err_out
+            err_out=$(PGPASSFILE="$pgpass" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$db_name" -c "SELECT 1;" 2>&1 >/dev/null)
+            local rc=$?
+            rm -f "$pgpass"
 
             if (( rc == 0 )); then
                 _doctor_check "Database connection ($dtype)" "PASS" "(connected to '${db_name}' @ ${db_host}:${db_port})"
@@ -2314,13 +2913,31 @@ doctor_check_config() {
         _doctor_check "Disk space (backups dir)" "WARN" "(low or unknown: $(human_size "${free:-0}"))"
     fi
 
-    local validate_tmp="/tmp/_archiver_doctor_$$.tmp"
+    local validate_tmp="$BACKUP_TMP/_val_$$_$(random_id).tmp"
     if ! cfg_validate "$config" > "$validate_tmp" 2>&1; then
         _doctor_check "Config validity" "FAIL" "($(tr '\n' ' ' < "$validate_tmp"))"
     else
         _doctor_check "Config validity" "PASS"
     fi
     rm -f "$validate_tmp"
+
+    # Encryption check
+    local enc_enabled
+    enc_enabled=$(cfg_get "$config" ENCRYPTION "false")
+    if [[ "$enc_enabled" == "true" ]]; then
+        echo -e "\n${BOLD}Encryption:${NC}"
+        if command -v openssl &>/dev/null; then
+            local enc_pass
+            enc_pass=$(cfg_get "$config" ENC_PASSWORD "")
+            if [[ -n "$enc_pass" ]]; then
+                _doctor_check "AES-256 encryption" "PASS" "(openssl available, password configured)"
+            else
+                _doctor_check "AES-256 encryption" "FAIL" "(encryption enabled but password is empty)"
+            fi
+        else
+            _doctor_check "AES-256 encryption" "FAIL" "(openssl not found; required for encryption)"
+        fi
+    fi
 
     # 2) cPanel / hosting account disk quota
     echo -e "\n${BOLD}Account disk usage:${NC}"
@@ -2455,53 +3072,57 @@ cmd_stats() {
 
     shopt -s nullglob
     local configs=( "$CONFIGS_DIR"/*.conf )
-    local archives=( "$BACKUP_OUT"/*.tar.gz "$BACKUP_OUT"/*.tar.gz.enc )
+    local archives=( "$BACKUP_OUT"/*.tar.gz "$BACKUP_OUT"/*.tar.gz.enc "$BACKUP_OUT"/*.part* )
     shopt -u nullglob
 
     echo "Total Configs: ${#configs[@]}"
     echo "Total Backups (files): ${#archives[@]}"
 
     local total_size=0
-    local a
-    for a in "${archives[@]}"; do
-        [[ -f "$a" ]] || continue
-        total_size=$(( total_size + $(get_file_size "$a") ))
-    done
+    if (( ${#archives[@]} > 0 )); then
+        local a
+        for a in "${archives[@]}"; do
+            [[ -f "$a" ]] || continue
+            total_size=$(( total_size + $(get_file_size "$a") ))
+        done
+    fi
     echo "Disk Usage (backups dir): $(human_size "$total_size")"
     echo
 
-    local c
-    for c in "${configs[@]}"; do
-        [[ -f "$c" ]] || continue
-        local profile
-        profile=$(basename "$c" .conf)
-        local mf
-        mf=$(meta_file_for "$profile")
+    if (( ${#configs[@]} > 0 )); then
+        local c
+        for c in "${configs[@]}"; do
+            [[ -f "$c" ]] || continue
+            local profile
+            profile=$(basename "$c" .conf)
+            local mf
+            mf=$(meta_file_for "$profile")
 
-        local last_success last_fail consec total_runs total_success rate
-        last_success=$(cfg_get "$mf" LAST_SUCCESS "never")
-        last_fail=$(cfg_get "$mf" LAST_FAILURE "never")
-        consec=$(cfg_get "$mf" CONSEC_FAILURES "0")
-        total_runs=$(cfg_get "$mf" TOTAL_RUNS "0")
-        total_success=$(cfg_get "$mf" TOTAL_SUCCESS "0")
+            local last_success last_fail consec total_runs total_success rate
+            last_success=$(cfg_get "$mf" LAST_SUCCESS "never")
+            last_fail=$(cfg_get "$mf" LAST_FAILURE "never")
+            consec=$(cfg_get "$mf" CONSEC_FAILURES "0")
+            total_runs=$(cfg_get "$mf" TOTAL_RUNS "0")
+            total_success=$(cfg_get "$mf" TOTAL_SUCCESS "0")
 
-        if [[ "$total_runs" -gt 0 ]]; then
-            rate=$(awk -v s="$total_success" -v t="$total_runs" 'BEGIN{printf "%.1f", (s/t)*100}')
-        else
-            rate="n/a"
-        fi
+            if [[ "$total_runs" -gt 0 ]]; then
+                rate=$(awk -v s="$total_success" -v t="$total_runs" 'BEGIN{printf "%.1f", (s/t)*100}')
+            else
+                rate="n/a"
+            fi
 
-        echo -e "${CYAN}${profile}${NC}"
-        echo "  Last Successful Backup: $last_success"
-        echo "  Last Failed Backup:     $last_fail"
-        echo "  Success Rate:           ${rate}% (${total_success}/${total_runs})"
-        if [[ "$consec" =~ ^[0-9]+$ ]] && (( consec >= 3 )); then
-            echo -e "  Consecutive Failures:   ${RED}${consec}${NC}"
-        else
-            echo "  Consecutive Failures:   $consec"
-        fi
-        echo
-    done
+            echo -e "${CYAN}${profile}${NC}"
+            echo "  Last Successful Backup: $last_success"
+            echo "  Last Failed Backup:     $last_fail"
+            echo "  Success Rate:           ${rate}% (${total_success}/${total_runs})"
+            if [[ "$consec" =~ ^[0-9]+$ ]] && (( consec >= 3 )); then
+                echo -e "  Consecutive Failures:   ${RED}${consec}${NC}"
+            else
+                echo "  Consecutive Failures:   $consec"
+            fi
+            echo
+        done
+    fi
 }
 
 # ============================================================
@@ -2542,15 +3163,15 @@ cmd_find() {
 
     echo -e "\n${BOLD}Searching backups for: ${term}${NC}\n"
 
-    shopt -s nullglob
+    shopt -s nullglob nocaseglob
     local archives=( "$BACKUP_OUT"/*"$term"* )
-    shopt -u nullglob
+    shopt -u nullglob nocaseglob
 
     if [[ ${#archives[@]} -eq 0 ]]; then
         echo "No archive filenames matched. Checking config profiles..."
-        shopt -s nullglob
+        shopt -s nullglob nocaseglob
         local configs=( "$CONFIGS_DIR"/*"$term"*.conf )
-        shopt -u nullglob
+        shopt -u nullglob nocaseglob
         if [[ ${#configs[@]} -eq 0 ]]; then
             echo -e "${YELLOW}No matches found.${NC}"
             return 0

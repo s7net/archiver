@@ -176,7 +176,7 @@ done
 
 echo ""
 
-for cmd in openssl mysqldump mysql sqlite3 flock crontab; do
+for cmd in openssl mysqldump mysql sqlite3 pg_dump psql flock crontab; do
     if command -v "$cmd" &>/dev/null; then
         success "${cmd}"
     else

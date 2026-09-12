@@ -5,7 +5,7 @@
 A production-grade backup tool for Linux, cPanel, and DirectAdmin servers.
 Pure Bash 4+ — no dependencies on `jq`, `python`, or `node`.
 
-Supports **MySQL/MariaDB**, **SQLite**, and **file/directory** backups,
+Supports **MySQL/MariaDB**, **PostgreSQL**, **SQLite**, and **file/directory** backups,
 with optional upload to **Telegram** and **Discord**, AES-256 encryption,
 retention policies, and cron scheduling.
 
@@ -48,6 +48,8 @@ source ~/.bashrc
 | `openssl` | Optional | AES-256 encryption |
 | `mysqldump` | Optional | MySQL / MariaDB backup |
 | `mysql` | Optional | MySQL restore |
+| `pg_dump` | Optional | PostgreSQL backup |
+| `psql` | Optional | PostgreSQL restore |
 | `sqlite3` | Optional | SQLite backup & integrity check |
 | `flock` | Optional | Concurrent run protection |
 | `crontab` | Optional | Scheduled backups |
@@ -114,6 +116,13 @@ archiver add
 # → enter host, port, user, password, database name
 ```
 
+### PostgreSQL
+```bash
+archiver add
+# → Database → postgres
+# → enter host, port (default 5432), user, password, database name
+```
+
 ### SQLite
 ```bash
 archiver add
@@ -126,11 +135,12 @@ archiver add
 archiver add
 # → Directory or Single File
 # → enter source path
+# → enter exclude patterns (optional, e.g. node_modules, .git, cache, *.log)
 ```
 
 ---
 
-## Upload Destinations
+## Upload Destinations & Failure Alerts
 
 ### Telegram
 - Create a bot via [@BotFather](https://t.me/BotFather)
@@ -144,6 +154,9 @@ Files larger than **45 MB** are automatically split into chunks.
 - Paste the URL during `archiver add`
 
 Files larger than **8 MB** are automatically split into chunks.
+
+### Failure Alerts
+If a backup fails (e.g. database down, disk space low, or upload error), Archiver immediately dispatches an alert with the server hostname, profile name, timestamp, and failure cause to your configured Telegram chat or Discord webhook.
 
 > If no upload destination is configured, backups are kept locally in `~/.archiver/backups/`.
 
