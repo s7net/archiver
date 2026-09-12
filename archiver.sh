@@ -3259,18 +3259,89 @@ cmd_import() {
 }
 
 # ============================================================
-#  COMMAND: update-check
+#  COMMAND: update / update-check
 # ============================================================
 
 cmd_update_check() {
     echo -e "\n${BOLD}Archiver Update Check${NC}\n"
-    echo "Current version: $ARCHIVER_VERSION"
-    echo
-    echo "Automatic update checking is not yet configured."
-    echo "To check for updates manually, visit the project repository:"
-    echo "  https://github.com/s7net/archiver/releases"
-    echo
-    echo "(Future versions will query the GitHub Releases API automatically.)"
+    echo "Current version: v$ARCHIVER_VERSION"
+    echo ""
+    echo -n "Checking GitHub repository... "
+    local remote_ver
+    remote_ver=$(curl -fsSL --max-time 6 "https://raw.githubusercontent.com/s7net/archiver/refs/heads/main/archiver.sh" 2>/dev/null | grep -m1 '^ARCHIVER_VERSION=' | cut -d'"' -f2 || true)
+    if [[ -z "$remote_ver" ]]; then
+        echo -e "${YELLOW}Could not check online version (offline or unreachable).${NC}"
+        echo "Repository: https://github.com/s7net/archiver"
+        return 0
+    fi
+
+    if [[ "$remote_ver" != "$ARCHIVER_VERSION" ]]; then
+        echo -e "${GREEN}New version available: v${remote_ver}${NC}\n"
+        echo "To update to the latest version, run:"
+        echo "  archiver update"
+        echo "or re-run the installer:"
+        echo "  curl -fsSL https://raw.githubusercontent.com/s7net/archiver/refs/heads/main/install.sh | bash"
+    else
+        echo -e "${GREEN}You are already using the latest version (v${ARCHIVER_VERSION}).${NC}"
+    fi
+}
+
+cmd_update() {
+    echo -e "\n${BOLD}Archiver Safe Self-Update${NC}\n"
+    echo "Current version: v$ARCHIVER_VERSION"
+
+    local self_bin
+    self_bin="$(command -v archiver 2>/dev/null || true)"
+    if [[ -z "$self_bin" || ! -f "$self_bin" ]]; then
+        self_bin="$0"
+    fi
+
+    if [[ ! -w "$self_bin" && ! -w "$(dirname "$self_bin")" ]]; then
+        error "Cannot write to $self_bin. Try running with sudo if installed system-wide."
+        return 1
+    fi
+
+    local tmp_bin="${BACKUP_TMP}/archiver_update.$$"
+    echo -e "${CYAN}[INFO]${NC} Downloading latest Archiver from GitHub..."
+    if ! curl -fsSL --max-time 60 "https://raw.githubusercontent.com/s7net/archiver/refs/heads/main/archiver.sh" -o "$tmp_bin"; then
+        rm -f "$tmp_bin" 2>/dev/null || true
+        error "Download failed. Check your internet connection."
+        return 1
+    fi
+
+    chmod +x "$tmp_bin"
+    if ! bash -n "$tmp_bin" 2>/dev/null; then
+        rm -f "$tmp_bin" 2>/dev/null || true
+        error "Integrity check failed (syntax error). Existing installation was not modified."
+        return 1
+    fi
+
+    if ! grep -q "ARCHIVER_VERSION" "$tmp_bin" 2>/dev/null; then
+        rm -f "$tmp_bin" 2>/dev/null || true
+        error "Integrity check failed (missing version signature). Existing installation was not modified."
+        return 1
+    fi
+
+    if ! "$tmp_bin" version &>/dev/null; then
+        rm -f "$tmp_bin" 2>/dev/null || true
+        error "Self-test failed on downloaded script. Existing installation was not modified."
+        return 1
+    fi
+
+    local new_ver
+    new_ver=$("$tmp_bin" version 2>/dev/null | awk '{print $NF}' || echo "latest")
+
+    cp -p "$self_bin" "${self_bin}.bak" 2>/dev/null || true
+    if mv -f "$tmp_bin" "$self_bin"; then
+        chmod 755 "$self_bin"
+        echo -e "${GREEN}[OK]${NC} Successfully updated Archiver to ${BOLD}${new_ver}${NC}!"
+        echo -e "${GREEN}[OK]${NC} All configs, backups, and schedules in ~/.archiver were preserved."
+        [[ -f "${self_bin}.bak" ]] && echo -e "     Previous binary backed up to: ${self_bin}.bak"
+    else
+        rm -f "$tmp_bin" 2>/dev/null || true
+        error "Failed to replace executable at $self_bin."
+        return 1
+    fi
 }
 
 # ============================================================
@@ -3316,6 +3387,7 @@ ${BOLD}COMMANDS${NC}
   ${CYAN}import${NC} <file>           Import configs from a tar.gz
 
   ${CYAN}version${NC}                 Show version
+  ${CYAN}update${NC}                  Update Archiver to latest version safely
   ${CYAN}update-check${NC}            Check for updates
   ${CYAN}help${NC}                    Show this help
 
@@ -3350,6 +3422,7 @@ case "$CMD" in
     export)         cmd_export "$@" ;;
     import)         cmd_import "$@" ;;
     version|-v|--version) cmd_version ;;
+    update)         cmd_update "$@" ;;
     update-check)   cmd_update_check ;;
     help|-h|--help|*) cmd_help ;;
 esac

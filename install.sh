@@ -38,13 +38,21 @@ ${BOLD}${CYAN}║        Archiver Installer v${ARCHIVER_VERSION}         ║${NC
 ${BOLD}${CYAN}╚══════════════════════════════════════════╝${NC}
 "
 
+# Parse optional flags
+AUTO_YES=false
+for arg in "${@:-}"; do
+    case "$arg" in
+        -y|--yes) AUTO_YES=true ;;
+    esac
+done
+
 # ── Step 1: Detect privilege level ───────────────────────────
 IS_ROOT=false
 if [[ "$(id -u)" -eq 0 ]]; then
     IS_ROOT=true
 fi
 
-# ── Step 2: Pick install directory ───────────────────────────
+# ── Step 2: Pick install directory & detect existing install ──
 if [[ "$IS_ROOT" == "true" ]] && [[ -d /usr/local/bin ]] && [[ -w /usr/local/bin ]]; then
     INSTALL_DIR="/usr/local/bin"
 else
@@ -53,30 +61,81 @@ fi
 
 DEST="${INSTALL_DIR}/${SCRIPT_NAME}"
 
+# Detect if archiver is already installed anywhere accessible
+EXISTING_PATH=""
+if [[ -f "$DEST" ]]; then
+    EXISTING_PATH="$DEST"
+elif command -v "$SCRIPT_NAME" &>/dev/null; then
+    _which_bin="$(command -v "$SCRIPT_NAME" 2>/dev/null || true)"
+    if [[ -n "$_which_bin" && -f "$_which_bin" ]]; then
+        EXISTING_PATH="$_which_bin"
+    fi
+elif [[ -f "/usr/local/bin/${SCRIPT_NAME}" ]]; then
+    EXISTING_PATH="/usr/local/bin/${SCRIPT_NAME}"
+elif [[ -f "${HOME}/bin/${SCRIPT_NAME}" ]]; then
+    EXISTING_PATH="${HOME}/bin/${SCRIPT_NAME}"
+fi
+
+# If existing installation found and writable, preserve its existing location
+IS_UPDATE=false
+if [[ -n "$EXISTING_PATH" && -f "$EXISTING_PATH" ]]; then
+    IS_UPDATE=true
+    if [[ -w "$EXISTING_PATH" || -w "$(dirname "$EXISTING_PATH")" ]]; then
+        INSTALL_DIR="$(dirname "$EXISTING_PATH")"
+        DEST="$EXISTING_PATH"
+    fi
+fi
+
 info "Install directory : $INSTALL_DIR"
 info "Target            : $DEST"
 echo ""
 
-# ── Step 3: Ask before overwriting ───────────────────────────
-if [[ -f "$DEST" ]]; then
-    EXISTING_VER=$("$DEST" version 2>/dev/null || echo "unknown")
-    echo -e "${YELLOW}Archiver is already installed.${NC}"
+# ── Step 3: Handle Update vs Fresh Install ───────────────────
+ARCHIVER_HOME="${HOME}/.archiver"
+CONFIGS_DIR="${ARCHIVER_HOME}/configs"
+BACKUPS_DIR="${ARCHIVER_HOME}/backups"
+
+EXISTING_CONF_COUNT=0
+EXISTING_BACKUP_COUNT=0
+if [[ -d "$CONFIGS_DIR" ]]; then
+    EXISTING_CONF_COUNT=$(find "$CONFIGS_DIR" -maxdepth 1 -name "*.conf" 2>/dev/null | wc -l | tr -d ' ')
+fi
+if [[ -d "$BACKUPS_DIR" ]]; then
+    EXISTING_BACKUP_COUNT=$(find "$BACKUPS_DIR" -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')
+fi
+
+if [[ "$IS_UPDATE" == "true" ]]; then
+    EXISTING_VER=$("$EXISTING_PATH" version 2>/dev/null || echo "unknown")
+    echo -e "${YELLOW}Existing Archiver installation detected:${NC}"
+    echo -e "  Location          : ${BOLD}${EXISTING_PATH}${NC}"
     echo -e "  Installed version : ${BOLD}${EXISTING_VER}${NC}"
-    echo -e "  Latest version    : ${BOLD}${ARCHIVER_VERSION}${NC}"
+    echo -e "  Target version    : ${BOLD}${ARCHIVER_VERSION}${NC}"
     echo ""
-    read -rp "$(echo -e "${CYAN}?${NC} Update to the latest version? [y/N]: ")" _confirm </dev/tty
-    if [[ ! "$_confirm" =~ ^[Yy]$ ]]; then
-        echo "Cancelled. No changes made."
-        exit 0
+    info "Mode: Safe Update"
+    info "All existing configurations, backups, logs, and schedules in ~/.archiver will be preserved."
+    if [[ "$EXISTING_CONF_COUNT" -gt 0 ]]; then
+        info "Found ${EXISTING_CONF_COUNT} existing backup configuration(s) — untouched."
     fi
     echo ""
+
+    # If interactive and not auto-confirmed via -y, give user prompt with default YES
+    if [[ "$AUTO_YES" != "true" && -t 0 && -c /dev/tty ]]; then
+        read -rp "$(echo -e "${CYAN}?${NC} Update to the latest version? [Y/n]: ")" _confirm </dev/tty || _confirm="y"
+        if [[ "$_confirm" =~ ^[Nn]$ ]]; then
+            echo "Cancelled by user. No changes made."
+            exit 0
+        fi
+        echo ""
+    fi
+else
+    info "Mode: Fresh Installation"
 fi
 
 # ── Step 4: Create install directory ─────────────────────────
 if [[ ! -d "$INSTALL_DIR" ]]; then
     info "Creating $INSTALL_DIR ..."
     mkdir -p "$INSTALL_DIR" || die "Could not create $INSTALL_DIR"
-    chmod 700 "$INSTALL_DIR"
+    [[ "$INSTALL_DIR" == "${HOME}/bin" ]] && chmod 700 "$INSTALL_DIR" 2>/dev/null || true
 fi
 
 # ── Step 5: Add ~/bin to PATH if needed ──────────────────────
@@ -119,43 +178,73 @@ if [[ "$INSTALL_DIR" == "${HOME}/bin" ]]; then
     echo ""
 fi
 
-# ── Step 6: Download or copy ──────────────────────────────────
+# ── Step 6: Atomic Download or copy via staging file ──────────
+TMP_DEST="${INSTALL_DIR}/.${SCRIPT_NAME}.tmp.$$$RANDOM"
+cleanup_staging() {
+    rm -f "$TMP_DEST" 2>/dev/null || true
+}
+trap cleanup_staging EXIT INT TERM
+
 _download_or_copy() {
-    # If archiver.sh sits next to this installer, use it directly (no network needed)
+    local target="$1"
     local self_dir
     self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
     local local_script="${self_dir}/archiver.sh"
 
     if [[ -f "$local_script" ]]; then
-        info "Found local archiver.sh — copying ..."
-        cp "$local_script" "$DEST" || die "Copy failed."
+        info "Found local archiver.sh — copying to staging..."
+        cp "$local_script" "$target" || die "Copy failed."
         return 0
     fi
 
     info "Downloading from GitHub ..."
 
     if command -v curl &>/dev/null; then
-        curl -fsSL --max-time 60 "$REPO_URL" -o "$DEST" \
+        curl -fsSL --max-time 60 "$REPO_URL" -o "$target" \
             || die "Download failed. Check your connection, or place archiver.sh next to install.sh and re-run."
     elif command -v wget &>/dev/null; then
-        wget -q --timeout=60 "$REPO_URL" -O "$DEST" \
+        wget -q --timeout=60 "$REPO_URL" -O "$target" \
             || die "Download failed. Check your connection, or place archiver.sh next to install.sh and re-run."
     else
         die "Neither curl nor wget is available. Place archiver.sh next to install.sh and re-run."
     fi
 }
 
-_download_or_copy
-chmod +x "$DEST"
+_download_or_copy "$TMP_DEST"
+chmod +x "$TMP_DEST"
 
-# ── Step 7: Verify installed file ────────────────────────────
-[[ -x "$DEST" ]] || die "Installed file is not executable: $DEST"
+# ── Step 7: Verify staged file before replacing live binary ───
+[[ -x "$TMP_DEST" ]] || die "Staged file is not executable. Existing files were not modified."
 
-if ! grep -q "ARCHIVER_VERSION" "$DEST" 2>/dev/null; then
-    die "Downloaded file does not look like a valid Archiver script. Aborting."
+if ! bash -n "$TMP_DEST" 2>/dev/null; then
+    die "Downloaded script failed syntax check. Existing files were not modified."
 fi
 
-success "File installed: $DEST"
+if ! grep -q "ARCHIVER_VERSION" "$TMP_DEST" 2>/dev/null; then
+    die "Downloaded file does not look like a valid Archiver script. Existing files were not modified."
+fi
+
+if ! "$TMP_DEST" version &>/dev/null; then
+    die "Downloaded script failed self-test execution. Existing files were not modified."
+fi
+
+# ── Step 8: Safe binary backup & atomic replacement ──────────
+if [[ -f "$DEST" ]]; then
+    cp -p "$DEST" "${DEST}.bak" 2>/dev/null || warn "Could not create backup of previous binary at ${DEST}.bak"
+    if [[ -f "${DEST}.bak" ]]; then
+        info "Previous executable safely backed up to: ${DEST}.bak"
+    fi
+fi
+
+mv -f "$TMP_DEST" "$DEST" || die "Failed to install executable to $DEST"
+chmod 755 "$DEST"
+trap - EXIT INT TERM
+
+if [[ "$IS_UPDATE" == "true" ]]; then
+    success "Archiver executable updated: $DEST"
+else
+    success "File installed: $DEST"
+fi
 echo ""
 
 # ── Step 8: Dependency check ─────────────────────────────────
@@ -218,7 +307,29 @@ else
 fi
 
 # ── Summary ───────────────────────────────────────────────────
-echo -e "
+if [[ "$IS_UPDATE" == "true" ]]; then
+    echo -e "
+${BOLD}${GREEN}══════════════════════════════════════════${NC}
+${BOLD}${GREEN}  Archiver update complete!               ${NC}
+${BOLD}${GREEN}══════════════════════════════════════════${NC}
+
+  ${BOLD}Updated to:${NC}          v${ARCHIVER_VERSION}
+  ${BOLD}Executable:${NC}          $DEST
+  ${BOLD}Backup executable:${NC}   ${DEST}.bak
+
+  ${BOLD}Data & Configuration Safety Summary:${NC}
+  ✓ Backup configurations : ${EXISTING_CONF_COUNT} configuration(s) preserved in ~/.archiver/configs/
+  ✓ Backup archives       : ${EXISTING_BACKUP_COUNT} archive(s) preserved in ~/.archiver/backups/
+  ✓ Crontab schedules     : Active cron schedules remained untouched
+  ✓ Logs and state        : Maintained safely in ~/.archiver/
+
+  ${BOLD}Quick check:${NC}
+    archiver doctor     — verify system health & configs
+    archiver list       — list active backup profiles
+    archiver help       — full command reference
+"
+else
+    echo -e "
 ${BOLD}${GREEN}══════════════════════════════════════════${NC}
 ${BOLD}${GREEN}  Installation complete!${NC}
 ${BOLD}${GREEN}══════════════════════════════════════════${NC}
@@ -231,6 +342,7 @@ ${BOLD}${GREEN}═════════════════════�
     archiver doctor     — check environment health
     archiver help       — full command reference
 "
+fi
 
 if [[ "$INSTALL_DIR" == "${HOME}/bin" ]]; then
     echo -e "  ${YELLOW}Tip:${NC} If 'archiver' is not found, run:"

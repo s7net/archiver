@@ -21,7 +21,8 @@ curl -fsSL https://raw.githubusercontent.com/s7net/archiver/refs/heads/main/inst
 
 That's it. The installer will:
 - Detect your privilege level (root → `/usr/local/bin`, otherwise → `~/bin`)
-- Ask before overwriting an existing installation
+- Safely update existing installations without affecting configurations, archives, or schedules
+- Automatically back up the previous binary (`archiver.bak`) before updating
 - Add `~/bin` to your `PATH` automatically if needed
 - Check all required and optional dependencies
 
@@ -103,6 +104,8 @@ archiver logs
 | `archiver export [file]` | Export all configs to a tar.gz |
 | `archiver import <file>` | Import configs from a tar.gz |
 | `archiver version` | Show version |
+| `archiver update` | Update Archiver to latest version safely |
+| `archiver update-check` | Check if a newer version is available |
 | `archiver help` | Show help |
 
 ---
