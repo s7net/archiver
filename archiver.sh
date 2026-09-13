@@ -9,7 +9,7 @@ set -uo pipefail
 
 ARCHIVER_VERSION="1.0.0"
 
-ARCHIVER_HOME="${HOME}/.archiver"
+ARCHIVER_HOME="${ARCHIVER_HOME:-$HOME/.archiver}"
 CONFIGS_DIR="${ARCHIVER_HOME}/configs"
 BACKUP_OUT="${ARCHIVER_HOME}/backups"
 BACKUP_TMP="${ARCHIVER_HOME}/tmp"
@@ -260,13 +260,71 @@ cfg_normalize_key() {
 cfg_get() {
     local file="$1" key="$2" default="${3:-}"
     [[ -f "$file" ]] || { echo "$default"; return; }
-    local line val
-    line=$(grep -m1 "^${key}=" "$file" 2>/dev/null) || true
+
+    local canon_key
+    canon_key=$(cfg_normalize_key "$key")
+
+    local line=""
+    # 1. Search for canonical key (case-insensitive, optional whitespace around =)
+    line=$(grep -m1 -iE "^[[:space:]]*${canon_key}[[:space:]]*=" "$file" 2>/dev/null || true)
+
+    # 2. If not found and original key differed, try original key
+    if [[ -z "$line" && "$key" != "$canon_key" ]]; then
+        line=$(grep -m1 -iE "^[[:space:]]*${key}[[:space:]]*=" "$file" 2>/dev/null || true)
+    fi
+
+    # 3. Check known aliases for this key
+    if [[ -z "$line" ]]; then
+        case "$canon_key" in
+            RETENTION_COUNT)
+                line=$(grep -m1 -iE "^[[:space:]]*(RETENTION|KEEP_COUNT|KEEP_LAST|KEEP_LOCAL_COUNT)[[:space:]]*=" "$file" 2>/dev/null || true)
+                ;;
+            DB_HOST)
+                line=$(grep -m1 -iE "^[[:space:]]*(HOST|DATABASE_HOST)[[:space:]]*=" "$file" 2>/dev/null || true)
+                ;;
+            DB_PORT)
+                line=$(grep -m1 -iE "^[[:space:]]*(PORT|DATABASE_PORT)[[:space:]]*=" "$file" 2>/dev/null || true)
+                ;;
+            DB_USER)
+                line=$(grep -m1 -iE "^[[:space:]]*(USER|USERNAME|DATABASE_USER)[[:space:]]*=" "$file" 2>/dev/null || true)
+                ;;
+            DB_PASS)
+                line=$(grep -m1 -iE "^[[:space:]]*(PASS|PASSWORD|DATABASE_PASSWORD|DATABASE_PASS)[[:space:]]*=" "$file" 2>/dev/null || true)
+                ;;
+            DB_NAME)
+                line=$(grep -m1 -iE "^[[:space:]]*(NAME|DATABASE_NAME)[[:space:]]*=" "$file" 2>/dev/null || true)
+                ;;
+            FILES_PATH)
+                line=$(grep -m1 -iE "^[[:space:]]*(PATH|DIRECTORY|FILE_PATH|FILES_PATH)[[:space:]]*=" "$file" 2>/dev/null || true)
+                ;;
+            EXCLUDE_PATTERNS)
+                line=$(grep -m1 -iE "^[[:space:]]*(EXCLUDE|EXCLUDES|EXCLUDE_PATTERNS)[[:space:]]*=" "$file" 2>/dev/null || true)
+                ;;
+            TG_ENABLED)
+                line=$(grep -m1 -iE "^[[:space:]]*(TELEGRAM|TG)[[:space:]]*=" "$file" 2>/dev/null || true)
+                ;;
+            DC_ENABLED)
+                line=$(grep -m1 -iE "^[[:space:]]*(DISCORD|DC)[[:space:]]*=" "$file" 2>/dev/null || true)
+                ;;
+        esac
+    fi
+
     if [[ -z "$line" ]]; then
         echo "$default"
         return
     fi
+
+    local val
     val="${line#*=}"
+    val=$(printf '%s' "$val" | tr -d '\r')
+    val=$(trim "$val")
+    # Strip enclosing quotes if present
+    if [[ "$val" =~ ^\"(.*)\"$ ]]; then
+        val="${BASH_REMATCH[1]}"
+    elif [[ "$val" =~ ^\'(.*)\'$ ]]; then
+        val="${BASH_REMATCH[1]}"
+    fi
+
     if [[ -z "$val" ]]; then
         echo "$default"
         return
@@ -274,20 +332,28 @@ cfg_get() {
 
     # Check if this config file uses CONFIG_VERSION 2 (where values are base64 encoded)
     local ver_line ver_val
-    ver_line=$(grep -m1 "^CONFIG_VERSION=" "$file" 2>/dev/null || true)
+    ver_line=$(grep -m1 -iE "^[[:space:]]*CONFIG_VERSION[[:space:]]*=" "$file" 2>/dev/null || true)
     ver_val="${ver_line#*=}"
+    ver_val=$(printf '%s' "$ver_val" | tr -d '\r' | tr -d ' "'\''')
 
     if [[ "$ver_val" == "Mg==" || "$ver_val" == "2" ]]; then
-        # v2 config: values are base64 encoded
-        local decoded
-        decoded=$(printf '%s' "$val" | _b64_decode)
-        echo "$decoded"
+        # v2 config: values are base64 encoded. If decoding produces printable text, use it;
+        # otherwise fallback to raw val (handles cases where user manually edited config in plaintext).
+        local decoded=""
+        if [[ "$val" =~ ^[A-Za-z0-9+/=]+$ ]] && (( ${#val} % 4 == 0 )); then
+            decoded=$(printf '%s' "$val" | _b64_decode 2>/dev/null || true)
+        fi
+        if [[ -n "$decoded" ]]; then
+            echo "$decoded"
+        else
+            echo "$val"
+        fi
     else
         # Legacy/plaintext format:
         # If val is strictly valid base64 (length multiple of 4, valid chars) and decodes to printable text
         if [[ "$val" =~ ^[A-Za-z0-9+/=]+$ ]] && (( ${#val} % 4 == 0 )) && [[ "$val" =~ [+=] || ${#val} -gt 16 ]]; then
             local decoded
-            decoded=$(printf '%s' "$val" | _b64_decode)
+            decoded=$(printf '%s' "$val" | _b64_decode 2>/dev/null || true)
             if [[ -n "$decoded" ]] && ! LC_ALL=C grep -q '[^[:print:][:space:]]' <<< "$decoded"; then
                 echo "$decoded"
                 return
@@ -739,31 +805,146 @@ meta_record_failure() {
 #  RETENTION
 # ============================================================
 
-# apply_retention <profile> <retention_count>
+# apply_retention <profile> [retention_count] [config_file]
 apply_retention() {
-    local profile="$1" count="$2"
-    [[ "$count" =~ ^[0-9]+$ ]] || return 0
-    (( count <= 0 )) && return 0
+    local profile="$1"
+    local count="${2:-}"
+    local config="${3:-}"
 
-    shopt -s nullglob
-    local files=( "$BACKUP_OUT/${profile}-"*.tar.gz "$BACKUP_OUT/${profile}-"*.tar.gz.enc )
-    shopt -u nullglob
+    # If count is not an integer > 0, attempt to read from config
+    if [[ ! "$count" =~ ^[0-9]+$ ]] || (( count <= 0 )); then
+        if [[ -n "$config" && -f "$config" ]]; then
+            count=$(cfg_get "$config" RETENTION_COUNT "0")
+        elif [[ -f "$CONFIGS_DIR/${profile}.conf" ]]; then
+            count=$(cfg_get "$CONFIGS_DIR/${profile}.conf" RETENTION_COUNT "0")
+        fi
+    fi
 
-    [[ ${#files[@]} -eq 0 ]] && return 0
+    # Clean count: strip any non-digits
+    count=$(echo "$count" | tr -cd '0-9')
+    count="${count:-0}"
 
+    if (( count <= 0 )); then
+        log_info "Retention [$profile]: Unlimited retention (count=0). All local backups kept."
+        return 0
+    fi
+
+    shopt -s nullglob nocaseglob
+    local candidate_files=()
+
+    # Pattern 1: match exact profile name with standard delimiters (-, _, .)
+    candidate_files+=(
+        "$BACKUP_OUT/${profile}-"*
+        "$BACKUP_OUT/${profile}_"*
+        "$BACKUP_OUT/${profile}."*
+    )
+
+    # Pattern 2: if profile has a prefix like db_ or files_, also look for the name without prefix
+    local stripped=""
+    if [[ "$profile" =~ ^db_(.+) ]]; then
+        stripped="${BASH_REMATCH[1]}"
+    elif [[ "$profile" =~ ^files_(.+) ]]; then
+        stripped="${BASH_REMATCH[1]}"
+    fi
+
+    if [[ -n "$stripped" ]]; then
+        candidate_files+=(
+            "$BACKUP_OUT/${stripped}-"*
+            "$BACKUP_OUT/${stripped}_"*
+            "$BACKUP_OUT/${stripped}."*
+        )
+    fi
+
+    # Pattern 3: check DB_NAME or FILES_LABEL if config provided
+    if [[ -n "$config" && -f "$config" ]]; then
+        local custom_label=""
+        custom_label=$(cfg_get "$config" DB_NAME "")
+        [[ -z "$custom_label" ]] && custom_label=$(cfg_get "$config" FILES_LABEL "")
+        if [[ -n "$custom_label" && "$custom_label" != "$profile" && "$custom_label" != "$stripped" ]]; then
+            candidate_files+=(
+                "$BACKUP_OUT/${custom_label}-"*
+                "$BACKUP_OUT/${custom_label}_"*
+                "$BACKUP_OUT/${custom_label}."*
+            )
+        fi
+    fi
+    shopt -u nullglob nocaseglob
+
+    # Filter only regular files, skip temp and lock files
+    local valid_files=()
+    if (( ${#candidate_files[@]} > 0 )); then
+        local f
+        for f in "${candidate_files[@]}"; do
+            [[ -f "$f" ]] || continue
+            case "$(basename "$f")" in
+                *.tmp|*.lock|*.cnf|*.err) continue ;;
+            esac
+            valid_files+=( "$f" )
+        done
+    fi
+
+    if (( ${#valid_files[@]} == 0 )); then
+        log_info "Retention [$profile]: No local backup files found in $BACKUP_OUT."
+        return 0
+    fi
+
+    # Group split chunks (.part*) under the base backup archive
+    local unique_backups=()
+    if (( ${#valid_files[@]} > 0 )); then
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && unique_backups+=("$line")
+        done < <(printf '%s\n' "${valid_files[@]}" | sed -E 's/\.part[0-9]+$//' | sort -u)
+    fi
+
+    # Key each unique backup for accurate chronological sorting:
+    # 1. First priority: timestamp in filename (YYYY-MM-DD_HH-MM-SS or YYYY-MM-DD)
+    # 2. Fallback: file modification time (mtime)
+    local keyed_backups=()
+    if (( ${#unique_backups[@]} > 0 )); then
+        local b
+        for b in "${unique_backups[@]}"; do
+            local bname
+            bname=$(basename "$b")
+            local sort_key=""
+            if [[ "$bname" =~ ([0-9]{4}[-_][0-9]{2}[-_][0-9]{2}[-_][0-9]{2}[-_][0-9]{2}[-_][0-9]{2}) ]]; then
+                sort_key="${BASH_REMATCH[1]}"
+            elif [[ "$bname" =~ ([0-9]{4}[-_][0-9]{2}[-_][0-9]{2}) ]]; then
+                sort_key="${BASH_REMATCH[1]}"
+            else
+                sort_key=$(stat -c '%Y' "$b" 2>/dev/null || stat -f '%m' "$b" 2>/dev/null || date -r "$b" '+%s' 2>/dev/null || echo "0")
+            fi
+            keyed_backups+=( "${sort_key}###${b}" )
+        done
+    fi
+
+    # Sort descending (newest first)
     local sorted=()
-    while IFS= read -r line; do
-        sorted+=("$line")
-    done < <(ls -1t "${files[@]}" 2>/dev/null)
+    if (( ${#keyed_backups[@]} > 0 )); then
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && sorted+=( "${line#*###}" )
+        done < <(printf '%s\n' "${keyed_backups[@]}" | sort -t'#' -k1,1 -r)
+    fi
 
     local total=${#sorted[@]}
+    log_info "Retention [$profile]: Found $total backup(s), configured to keep the last $count."
+
+    local removed_count=0
     if (( total > count )); then
         local i
         for (( i=count; i<total; i++ )); do
-            log_info "Retention: removing old backup $(basename "${sorted[$i]}")"
-            rm -f "${sorted[$i]}"
-            rm -f "${sorted[$i]}".part* 2>/dev/null || true
+            local target="${sorted[$i]}"
+            log_info "Retention [$profile]: Removing old backup $(basename "$target")"
+            rm -f "$target"
+            # Remove any split parts (.part*)
+            rm -f "${target}.part"* 2>/dev/null || true
+            # Remove any auxiliary metadata or checksum files
+            rm -f "${target}.sha256" "${target}.md5" 2>/dev/null || true
+            (( removed_count++ )) || true
         done
+        local kept_count=$(( total - removed_count ))
+        log_info "Retention [$profile]: Cleanup complete. Removed $removed_count old backup(s), kept $kept_count."
+    else
+        log_info "Retention [$profile]: Within limit ($total <= $count). No files to remove."
     fi
 }
 
@@ -1140,7 +1321,7 @@ run_db_backup() {
 
     local retention
     retention=$(cfg_get "$config" RETENTION_COUNT "0")
-    apply_retention "$profile" "$retention"
+    apply_retention "$profile" "$retention" "$config"
 
     return $result
 }
@@ -1242,7 +1423,7 @@ run_postgres_backup() {
 
     local retention
     retention=$(cfg_get "$config" RETENTION_COUNT "0")
-    apply_retention "$profile" "$retention"
+    apply_retention "$profile" "$retention" "$config"
 
     return $result
 }
@@ -1322,7 +1503,7 @@ run_sqlite_backup() {
 
     local retention
     retention=$(cfg_get "$config" RETENTION_COUNT "0")
-    apply_retention "$profile" "$retention"
+    apply_retention "$profile" "$retention" "$config"
 
     return $result
 }
@@ -1417,7 +1598,7 @@ run_files_backup() {
 
     local retention
     retention=$(cfg_get "$config" RETENTION_COUNT "0")
-    apply_retention "$profile" "$retention"
+    apply_retention "$profile" "$retention" "$config"
 
     return $result
 }
@@ -1970,10 +2151,14 @@ cmd_run() {
         fi
 
         if ! precheck_disk_space "$config" "$profile"; then
-            meta_record_failure "$profile"
-            notify_failure "$config" "$profile" "Insufficient disk space"
-            failed=$(( failed + 1 ))
-            continue
+            log_warn "[$profile] Low disk space before backup — running retention cleanup early..."
+            apply_retention "$profile" "" "$config"
+            if ! precheck_disk_space "$config" "$profile"; then
+                meta_record_failure "$profile"
+                notify_failure "$config" "$profile" "Insufficient disk space"
+                failed=$(( failed + 1 ))
+                continue
+            fi
         fi
 
         local rc=0
@@ -2921,6 +3106,15 @@ doctor_check_config() {
     fi
     rm -f "$validate_tmp"
 
+    # Retention policy check
+    local ret_count
+    ret_count=$(cfg_get "$config" RETENTION_COUNT "0")
+    if [[ "$ret_count" =~ ^[0-9]+$ ]] && (( ret_count > 0 )); then
+        _doctor_check "Retention policy" "PASS" "(configured to keep last ${ret_count} backups)"
+    else
+        _doctor_check "Retention policy" "INFO" "(unlimited retention: keeping all local backups)"
+    fi
+
     # Encryption check
     local enc_enabled
     enc_enabled=$(cfg_get "$config" ENCRYPTION "false")
@@ -3259,6 +3453,64 @@ cmd_import() {
 }
 
 # ============================================================
+#  COMMAND: retention (cleanup)
+# ============================================================
+
+cmd_retention() {
+    local profile=""
+    local custom_count=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --count|-c)
+                custom_count="$2"; shift 2 ;;
+            *)
+                if [[ -z "$profile" ]]; then
+                    profile="$1"
+                fi
+                shift ;;
+        esac
+    done
+
+    echo -e "\n${BOLD}${CYAN}Archiver Backup Retention Enforcement${NC}\n"
+
+    shopt -s nullglob
+    local configs=()
+    if [[ -n "$profile" ]]; then
+        if [[ -f "$CONFIGS_DIR/${profile}.conf" ]]; then
+            configs=( "$CONFIGS_DIR/${profile}.conf" )
+        elif [[ -f "$CONFIGS_DIR/db_${profile}.conf" ]]; then
+            configs=( "$CONFIGS_DIR/db_${profile}.conf" )
+        elif [[ -f "$CONFIGS_DIR/files_${profile}.conf" ]]; then
+            configs=( "$CONFIGS_DIR/files_${profile}.conf" )
+        else
+            echo -e "${RED}No such profile: ${profile}${NC}"
+            return 1
+        fi
+    else
+        configs=( "$CONFIGS_DIR"/*.conf )
+    fi
+    shopt -u nullglob
+
+    if [[ ${#configs[@]} -eq 0 ]]; then
+        echo -e "${YELLOW}No backup configs found.${NC}"
+        return 0
+    fi
+
+    for cfg in "${configs[@]}"; do
+        local p
+        p=$(basename "$cfg" .conf)
+        local ret="$custom_count"
+        if [[ -z "$ret" ]]; then
+            ret=$(cfg_get "$cfg" RETENTION_COUNT "0")
+        fi
+        echo -e "${BOLD}--- Profile: [${CYAN}${p}${NC}${BOLD}] (retention=${ret:-0}) ---${NC}"
+        apply_retention "$p" "$ret" "$cfg"
+        echo ""
+    done
+}
+
+# ============================================================
 #  COMMAND: update / update-check
 # ============================================================
 
@@ -3386,6 +3638,8 @@ ${BOLD}COMMANDS${NC}
   ${CYAN}export${NC} [file]           Export all configs to a tar.gz
   ${CYAN}import${NC} <file>           Import configs from a tar.gz
 
+  ${CYAN}retention${NC} [profile] [--count N]
+                          Enforce backup retention policy and remove old backups
   ${CYAN}version${NC}                 Show version
   ${CYAN}update${NC}                  Update Archiver to latest version safely
   ${CYAN}update-check${NC}            Check for updates
@@ -3403,26 +3657,29 @@ ${BOLD}DIRECTORIES${NC}
 #  ENTRY POINT
 # ============================================================
 
-CMD="${1:-help}"
-shift || true
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    CMD="${1:-help}"
+    shift || true
 
-case "$CMD" in
-    add)            cmd_add "$@" ;;
-    edit)           cmd_edit "$@" ;;
-    remove)         cmd_remove "$@" ;;
-    list)           cmd_list "$@" ;;
-    run)            cmd_run "$@" ;;
-    restore)        cmd_restore "$@" ;;
-    cron)           cmd_cron "$@" ;;
-    doctor)         cmd_doctor "$@" ;;
-    test)           cmd_test "$@" ;;
-    stats)          cmd_stats "$@" ;;
-    logs)           cmd_logs "$@" ;;
-    find)           cmd_find "$@" ;;
-    export)         cmd_export "$@" ;;
-    import)         cmd_import "$@" ;;
-    version|-v|--version) cmd_version ;;
-    update)         cmd_update "$@" ;;
-    update-check)   cmd_update_check ;;
-    help|-h|--help|*) cmd_help ;;
-esac
+    case "$CMD" in
+        add)            cmd_add "$@" ;;
+        edit)           cmd_edit "$@" ;;
+        remove)         cmd_remove "$@" ;;
+        list)           cmd_list "$@" ;;
+        run)            cmd_run "$@" ;;
+        restore)        cmd_restore "$@" ;;
+        cron)           cmd_cron "$@" ;;
+        doctor)         cmd_doctor "$@" ;;
+        test)           cmd_test "$@" ;;
+        stats)          cmd_stats "$@" ;;
+        logs)           cmd_logs "$@" ;;
+        find)           cmd_find "$@" ;;
+        export)         cmd_export "$@" ;;
+        import)         cmd_import "$@" ;;
+        retention|cleanup) cmd_retention "$@" ;;
+        version|-v|--version) cmd_version ;;
+        update)         cmd_update "$@" ;;
+        update-check)   cmd_update_check ;;
+        help|-h|--help|*) cmd_help ;;
+    esac
+fi

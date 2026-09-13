@@ -103,6 +103,7 @@ archiver logs
 | `archiver find <term>` | Search backups by name or profile |
 | `archiver export [file]` | Export all configs to a tar.gz |
 | `archiver import <file>` | Import configs from a tar.gz |
+| `archiver retention [profile]` | Enforce retention policy and remove old backups |
 | `archiver version` | Show version |
 | `archiver update` | Update Archiver to latest version safely |
 | `archiver update-check` | Check if a newer version is available |
