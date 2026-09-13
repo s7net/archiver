@@ -118,6 +118,8 @@ archiver logs
 | `archiver export [file]` | Export all configs to a tar.gz |
 | `archiver import <file>` | Import configs from a tar.gz |
 | `archiver retention [profile]` | Enforce retention policy and remove old backups |
+| `archiver settings` | Interactive global settings, bots, and Topic Mode configuration |
+| `archiver bot [list\|add\|remove\|default\|test]` | Manage Telegram bots and test connections |
 | `archiver version` | Show version |
 | `archiver update` | Update Archiver to latest version safely |
 | `archiver update-check` | Check if a newer version is available |
@@ -158,23 +160,59 @@ archiver add
 
 ---
 
+## Global Settings & Telegram Bots
+
+You can register your Telegram bots once and reuse them across all backup profiles without having to re-enter tokens:
+
+```bash
+# Open interactive settings menu
+archiver settings
+
+# Or manage bots directly via CLI
+archiver bot add main       # Add a bot with token and default chat/group
+archiver bot list           # List configured bots
+archiver bot default main   # Set default bot for all backups
+archiver bot test main      # Test bot connection and topic creation
+```
+
+When creating backups with `archiver add`, Archiver automatically lets you pick from your saved bots with a single click.
+
+---
+
+## Telegram Topic Mode (Forum Supergroups)
+
+Archiver features **Topic Mode** for Telegram Supergroups with Topics (Forum) enabled:
+
+- **Automatic Forum Topic Creation**: When backups run, Archiver automatically calls Telegram's `createForumTopic` API to create a dedicated topic thread for each profile.
+- **Smart Server Hostname Naming**: Topics are formatted as:
+  ```
+  <Capitalized-Hostname-Prefix> - <Profile-Name>
+  ```
+  *Examples:*
+  - Hostname `srv1.company.com` + profile `db_site` $\rightarrow$ `Srv1 - db_site`
+  - Hostname `node-db` + profile `files_app` $\rightarrow$ `Node-db - files_app`
+- **Topic Caching & Re-use**: The created `message_thread_id` is cached and saved in the profile config. Subsequent backups and failure alerts for that profile are sent into the **same thread** rather than creating duplicate topics.
+- **Requirements**:
+  1. The group must be a Telegram **Supergroup** with **Topics** enabled.
+  2. The bot must be an **Administrator** with the **"Manage Topics"** permission.
+  3. Enter the numerical group ID (e.g. `-1001234567890`) when enabling Topic Mode in `archiver settings` or `archiver bot add`.
+
+---
+
 ## Upload Destinations & Failure Alerts
 
 ### Telegram
 - Create a bot via [@BotFather](https://t.me/BotFather)
-- Get your Chat ID (and optionally a Topic/Thread ID for supergroups)
-- Enter them during `archiver add`
-
-Files larger than **45 MB** are automatically split into chunks.
+- Configure it in `archiver settings` or enter the token directly during `archiver add`
+- Files larger than **45 MB** are automatically split into chunks.
 
 ### Discord
 - Create a Webhook in your server's channel settings
 - Paste the URL during `archiver add`
-
-Files larger than **8 MB** are automatically split into chunks.
+- Files larger than **8 MB** are automatically split into chunks.
 
 ### Failure Alerts
-If a backup fails (e.g. database down, disk space low, or upload error), Archiver immediately dispatches an alert with the server hostname, profile name, timestamp, and failure cause to your configured Telegram chat or Discord webhook.
+If a backup fails (e.g. database down, disk space low, or upload error), Archiver immediately dispatches an alert with the server hostname, profile name, timestamp, and failure cause to your configured Telegram chat/topic or Discord webhook.
 
 > If no upload destination is configured, backups are kept locally in `~/.archiver/backups/`.
 

@@ -7,7 +7,7 @@
 
 set -uo pipefail
 
-ARCHIVER_VERSION="1.0.1"
+ARCHIVER_VERSION="1.0.2"
 
 ARCHIVER_HOME="${ARCHIVER_HOME:-$HOME/.archiver}"
 CONFIGS_DIR="${ARCHIVER_HOME}/configs"
@@ -18,6 +18,9 @@ LOCK_DIR="${ARCHIVER_HOME}/lock"
 CACHE_DIR="${ARCHIVER_HOME}/cache"
 METADATA_DIR="${ARCHIVER_HOME}/metadata"
 RESTORE_DIR="${ARCHIVER_HOME}/restore"
+BOTS_DIR="${ARCHIVER_HOME}/bots"
+SETTINGS_FILE="${ARCHIVER_HOME}/settings.conf"
+TOPICS_CACHE="${ARCHIVER_HOME}/cache/topics.map"
 
 LOG_FILE="${LOG_DIR}/archiver.log"
 LOCK_FILE="${LOCK_DIR}/archiver.lock"
@@ -36,12 +39,15 @@ fi
 _bootstrap_dirs() {
     local d
     for d in "$ARCHIVER_HOME" "$CONFIGS_DIR" "$BACKUP_OUT" "$BACKUP_TMP" \
-             "$LOG_DIR" "$LOCK_DIR" "$CACHE_DIR" "$METADATA_DIR" "$RESTORE_DIR"; do
+             "$LOG_DIR" "$LOCK_DIR" "$CACHE_DIR" "$METADATA_DIR" "$RESTORE_DIR" "$BOTS_DIR"; do
         mkdir -p "$d"
         chmod 700 "$d"
     done
     find "$CONFIGS_DIR" -name "*.conf" -exec chmod 600 {} \; 2>/dev/null || true
+    find "$BOTS_DIR" -name "*.conf" -exec chmod 600 {} \; 2>/dev/null || true
     [[ -f "$LOG_FILE" ]] && chmod 600 "$LOG_FILE" 2>/dev/null || true
+    [[ -f "$SETTINGS_FILE" ]] && chmod 600 "$SETTINGS_FILE" 2>/dev/null || true
+    [[ -f "$TOPICS_CACHE" ]] && chmod 600 "$TOPICS_CACHE" 2>/dev/null || true
 }
 _bootstrap_dirs
 
@@ -250,6 +256,9 @@ cfg_normalize_key() {
         TELEGRAM_TOKEN|TG_TOKEN) echo "TG_TOKEN" ;;
         TELEGRAM_CHAT|TELEGRAM_CHAT_ID|TG_CHAT|TG_CHAT_ID) echo "TG_CHAT_ID" ;;
         TELEGRAM_TOPIC|TELEGRAM_TOPIC_ID|TG_TOPIC|TG_TOPIC_ID) echo "TG_TOPIC_ID" ;;
+        BOT|BOT_NAME|TG_BOT|TG_BOT_NAME) echo "TG_BOT_NAME" ;;
+        TOPIC_MODE|TG_TOPIC_MODE) echo "TG_TOPIC_MODE" ;;
+        TOPIC_GROUP|TOPIC_GROUP_ID|TG_TOPIC_GROUP|TG_TOPIC_GROUP_ID) echo "TG_TOPIC_GROUP_ID" ;;
         DISCORD|DC) echo "DC_ENABLED" ;;
         DISCORD_URL|DISCORD_WEBHOOK|DC_URL|DC_WEBHOOK) echo "DC_URL" ;;
         *) echo "$k" ;;
@@ -405,6 +414,91 @@ cfg_write() {
     done
 }
 
+# ============================================================
+#  GLOBAL SETTINGS & BOT HELPERS
+# ============================================================
+
+settings_get() {
+    local key="$1" default="${2:-}"
+    cfg_get "$SETTINGS_FILE" "$key" "$default"
+}
+
+settings_set() {
+    local key="$1" val="$2"
+    cfg_set "$SETTINGS_FILE" "$key" "$val"
+}
+
+bot_file() {
+    local name="$1"
+    echo "${BOTS_DIR}/${name}.conf"
+}
+
+bot_save() {
+    local name="$1" token="$2" chat_id="$3" topic_mode="${4:-false}" group_id="${5:-}"
+    local f
+    f=$(bot_file "$name")
+    cfg_write "$f" \
+        CONFIG_VERSION 2 \
+        BOT_NAME "$name" \
+        TG_TOKEN "$token" \
+        TG_CHAT_ID "$chat_id" \
+        TG_TOPIC_MODE "$topic_mode" \
+        TG_TOPIC_GROUP_ID "$group_id"
+}
+
+bot_get() {
+    local name="$1" key="$2" default="${3:-}"
+    local f
+    f=$(bot_file "$name")
+    cfg_get "$f" "$key" "$default"
+}
+
+bot_delete() {
+    local name="$1"
+    rm -f "$(bot_file "$name")" 2>/dev/null || true
+    if [[ "$(settings_get "DEFAULT_BOT")" == "$name" ]]; then
+        settings_set "DEFAULT_BOT" ""
+    fi
+}
+
+bot_list() {
+    shopt -s nullglob
+    local bfiles=( "$BOTS_DIR"/*.conf )
+    shopt -u nullglob
+    local b
+    for b in "${bfiles[@]}"; do
+        basename "$b" .conf
+    done
+}
+
+topic_cache_get() {
+    local key="$1"
+    [[ -f "$TOPICS_CACHE" ]] || return 1
+    local line
+    line=$(grep -m1 "^${key}=" "$TOPICS_CACHE" 2>/dev/null || true)
+    if [[ -n "$line" ]]; then
+        echo "${line#*=}"
+        return 0
+    fi
+    return 1
+}
+
+topic_cache_set() {
+    local key="$1" val="$2"
+    mkdir -p "$(dirname "$TOPICS_CACHE")" 2>/dev/null || true
+    touch "$TOPICS_CACHE"
+    chmod 600 "$TOPICS_CACHE" 2>/dev/null || true
+    if grep -q "^${key}=" "$TOPICS_CACHE" 2>/dev/null; then
+        local tmp
+        tmp=$(mktemp "${TOPICS_CACHE}.XXXXXX")
+        awk -v k="$key" -v v="${key}=${val}" 'BEGIN{FS="="} { if ($1==k) print v; else print $0 }' "$TOPICS_CACHE" > "$tmp"
+        mv "$tmp" "$TOPICS_CACHE"
+        chmod 600 "$TOPICS_CACHE" 2>/dev/null || true
+    else
+        echo "${key}=${val}" >> "$TOPICS_CACHE"
+    fi
+}
+
 # cfg_validate <file> -> checks required keys based on BACKUP_TYPE
 cfg_validate() {
     local file="$1"
@@ -474,13 +568,57 @@ cfg_validate() {
 
     # Telegram notification validity check
     if [[ "$(cfg_get "$file" TG_ENABLED)" == "true" ]]; then
-        local k
-        for k in TG_TOKEN TG_CHAT_ID; do
-            if [[ -z "$(cfg_get "$file" "$k")" ]]; then
-                echo "Missing $k (TG_ENABLED is true)"
+        local token chat bot_name
+        token=$(cfg_get "$file" TG_TOKEN "")
+        chat=$(cfg_get "$file" TG_CHAT_ID "")
+        bot_name=$(cfg_get "$file" TG_BOT_NAME "")
+
+        if [[ -n "$bot_name" ]]; then
+            [[ -z "$token" ]] && token=$(bot_get "$bot_name" "TG_TOKEN" "")
+            [[ -z "$chat" ]]  && chat=$(bot_get "$bot_name" "TG_CHAT_ID" "")
+            if [[ -z "$token" ]]; then
+                echo "Configured bot '$bot_name' not found or has empty token"
                 (( errors++ )) || true
             fi
-        done
+        fi
+
+        if [[ -z "$token" ]]; then
+            local def_bot
+            def_bot=$(settings_get "DEFAULT_BOT" "")
+            if [[ -n "$def_bot" ]]; then
+                token=$(bot_get "$def_bot" "TG_TOKEN" "")
+                [[ -z "$chat" ]] && chat=$(bot_get "$def_bot" "TG_CHAT_ID" "")
+            fi
+        fi
+
+        [[ -z "$token" ]] && token=$(settings_get "DEFAULT_TG_TOKEN" "")
+        [[ -z "$chat" ]]  && chat=$(settings_get "DEFAULT_TG_CHAT" "")
+
+        local is_topic_mode
+        is_topic_mode=$(cfg_get "$file" TG_TOPIC_MODE "")
+        [[ -z "$is_topic_mode" && -n "$bot_name" ]] && is_topic_mode=$(bot_get "$bot_name" "TG_TOPIC_MODE" "")
+        [[ -z "$is_topic_mode" ]] && is_topic_mode=$(settings_get "TOPIC_MODE" "false")
+
+        local group_id
+        group_id=$(cfg_get "$file" TG_TOPIC_GROUP_ID "")
+        [[ -z "$group_id" && -n "$bot_name" ]] && group_id=$(bot_get "$bot_name" "TG_TOPIC_GROUP_ID" "")
+        [[ -z "$group_id" ]] && group_id=$(settings_get "TOPIC_GROUP_ID" "")
+
+        if [[ -z "$token" ]]; then
+            echo "Missing TG_TOKEN (TG_ENABLED is true and no valid bot configured)"
+            (( errors++ )) || true
+        fi
+        if [[ "$is_topic_mode" == "true" ]]; then
+            if [[ -z "$group_id" && -z "$chat" ]]; then
+                echo "Missing TG_TOPIC_GROUP_ID or TG_CHAT_ID for Topic Mode"
+                (( errors++ )) || true
+            fi
+        else
+            if [[ -z "$chat" ]]; then
+                echo "Missing TG_CHAT_ID (TG_ENABLED is true)"
+                (( errors++ )) || true
+            fi
+        fi
     fi
 
     # Discord notification validity check
@@ -1007,8 +1145,131 @@ verify_discord_response() {
 }
 
 # ============================================================
-#  UPLOAD - TELEGRAM
+#  UPLOAD - TELEGRAM & FORUM TOPIC MODE
 # ============================================================
+
+# get_topic_name <profile> -> formats: Capitalized(hostname_prefix) - profile
+get_topic_name() {
+    local profile="$1"
+    local raw_host
+    raw_host=$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo "Server")
+    raw_host="${raw_host%%.*}"
+    raw_host=$(trim "$raw_host")
+    [[ -z "$raw_host" ]] && raw_host="Server"
+    local first_char rest_chars cap_host
+    first_char=$(echo "${raw_host:0:1}" | tr '[:lower:]' '[:upper:]')
+    rest_chars="${raw_host:1}"
+    cap_host="${first_char}${rest_chars}"
+    echo "${cap_host} - ${profile}"
+}
+
+# telegram_create_topic <token> <chat_id> <topic_name> -> echoes thread_id on success
+telegram_create_topic() {
+    local token="$1" chat_id="$2" topic_name="$3"
+    local tmp_resp="${BACKUP_TMP}/_tg_topic_$$.json"
+    local http_code
+
+    http_code=$(curl -fsSL --max-time 20 \
+        -X POST "https://api.telegram.org/bot${token}/createForumTopic" \
+        -d "chat_id=${chat_id}" \
+        --data-urlencode "name=${topic_name}" \
+        -o "$tmp_resp" -w "%{http_code}" 2>&1 || true)
+
+    local resp=""
+    [[ -f "$tmp_resp" ]] && resp=$(cat "$tmp_resp" 2>/dev/null || echo "")
+    rm -f "$tmp_resp" 2>/dev/null || true
+
+    if [[ "$resp" =~ \"ok\":[[:space:]]*true ]]; then
+        local thread_id
+        thread_id=$(grep -oE '"message_thread_id":[[:space:]]*[0-9]+' <<< "$resp" | grep -oE '[0-9]+' | head -n1 || true)
+        if [[ -n "$thread_id" ]]; then
+            log_info "Telegram forum topic created: '${topic_name}' (ID: ${thread_id})"
+            echo "$thread_id"
+            return 0
+        fi
+    fi
+
+    local err_desc
+    err_desc=$(grep -oE '"description":[[:space:]]*"[^"]+"' <<< "$resp" | cut -d'"' -f4 || echo "HTTP $http_code")
+    log_error "Failed to create Telegram forum topic '${topic_name}': ${err_desc}"
+    if [[ "$err_desc" =~ rights|admin|permission ]]; then
+        log_warn "Please ensure Telegram bot is Administrator with 'Manage Topics' permission in group ${chat_id}."
+    elif [[ "$err_desc" =~ forum|chat\ must\ be ]]; then
+        log_warn "Please ensure Topics (Forum) is enabled in group settings for group ${chat_id}."
+    fi
+    echo ""
+    return 1
+}
+
+# resolve_telegram_credentials <config> <profile>
+# Sets: TG_RESOLVED_TOKEN, TG_RESOLVED_CHAT, TG_RESOLVED_TOPIC
+resolve_telegram_credentials() {
+    local config="$1" profile="$2"
+    TG_RESOLVED_TOKEN=$(cfg_get "$config" TG_TOKEN "")
+    TG_RESOLVED_CHAT=$(cfg_get  "$config" TG_CHAT_ID "")
+    TG_RESOLVED_TOPIC=$(cfg_get "$config" TG_TOPIC_ID "")
+
+    local bot_name
+    bot_name=$(cfg_get "$config" TG_BOT_NAME "")
+    if [[ -n "$bot_name" ]]; then
+        [[ -z "$TG_RESOLVED_TOKEN" ]] && TG_RESOLVED_TOKEN=$(bot_get "$bot_name" "TG_TOKEN" "")
+        [[ -z "$TG_RESOLVED_CHAT" ]]  && TG_RESOLVED_CHAT=$(bot_get  "$bot_name" "TG_CHAT_ID" "")
+    fi
+
+    # Fallback to default bot or global settings
+    if [[ -z "$TG_RESOLVED_TOKEN" ]]; then
+        local def_bot
+        def_bot=$(settings_get "DEFAULT_BOT" "")
+        if [[ -n "$def_bot" ]]; then
+            TG_RESOLVED_TOKEN=$(bot_get "$def_bot" "TG_TOKEN" "")
+            [[ -z "$TG_RESOLVED_CHAT" ]] && TG_RESOLVED_CHAT=$(bot_get "$def_bot" "TG_CHAT_ID" "")
+        fi
+    fi
+    [[ -z "$TG_RESOLVED_TOKEN" ]] && TG_RESOLVED_TOKEN=$(settings_get "DEFAULT_TG_TOKEN" "")
+    [[ -z "$TG_RESOLVED_CHAT" ]]  && TG_RESOLVED_CHAT=$(settings_get "DEFAULT_TG_CHAT" "")
+
+    # Resolve Topic Mode
+    local topic_mode group_id
+    topic_mode=$(cfg_get "$config" TG_TOPIC_MODE "")
+    group_id=$(cfg_get   "$config" TG_TOPIC_GROUP_ID "")
+
+    if [[ -z "$topic_mode" && -n "$bot_name" ]]; then
+        topic_mode=$(bot_get "$bot_name" "TG_TOPIC_MODE" "")
+        [[ -z "$group_id" ]] && group_id=$(bot_get "$bot_name" "TG_TOPIC_GROUP_ID" "")
+    fi
+    if [[ -z "$topic_mode" ]]; then
+        topic_mode=$(settings_get "TOPIC_MODE" "false")
+        [[ -z "$group_id" ]] && group_id=$(settings_get "TOPIC_GROUP_ID" "")
+    fi
+
+    if [[ "$topic_mode" == "true" ]]; then
+        local target_group="${group_id:-$TG_RESOLVED_CHAT}"
+        if [[ -n "$target_group" ]]; then
+            TG_RESOLVED_CHAT="$target_group"
+            if [[ -z "$TG_RESOLVED_TOPIC" ]]; then
+                # Check cache first
+                local cached
+                cached=$(topic_cache_get "$profile" 2>/dev/null || true)
+                if [[ -n "$cached" ]]; then
+                    TG_RESOLVED_TOPIC="$cached"
+                    cfg_set "$config" TG_TOPIC_ID "$cached" 2>/dev/null || true
+                elif [[ -n "$TG_RESOLVED_TOKEN" ]]; then
+                    # Create the topic via Telegram API
+                    local tname
+                    tname=$(get_topic_name "$profile")
+                    log_info "Topic Mode: Resolving forum topic '${tname}' in group ${target_group}..."
+                    local new_tid
+                    new_tid=$(telegram_create_topic "$TG_RESOLVED_TOKEN" "$target_group" "$tname")
+                    if [[ -n "$new_tid" ]]; then
+                        TG_RESOLVED_TOPIC="$new_tid"
+                        cfg_set "$config" TG_TOPIC_ID "$new_tid" 2>/dev/null || true
+                        topic_cache_set "$profile" "$new_tid" 2>/dev/null || true
+                    fi
+                fi
+            fi
+        fi
+    fi
+}
 
 send_telegram_file() {
     local file="$1" token="$2" chat_id="$3" topic_id="$4" caption="$5"
@@ -1163,18 +1424,25 @@ dispatch_send() {
     local all_ok=true
     local any_enabled=false
 
-    local tg_enabled tg_token tg_chat tg_topic dc_enabled dc_url keep_local
+    local tg_enabled dc_enabled dc_url keep_local
     tg_enabled=$(cfg_get "$config" TG_ENABLED  "false")
-    tg_token=$(cfg_get   "$config" TG_TOKEN    "")
-    tg_chat=$(cfg_get    "$config" TG_CHAT_ID  "")
-    tg_topic=$(cfg_get   "$config" TG_TOPIC_ID "")
     dc_enabled=$(cfg_get "$config" DC_ENABLED  "false")
     dc_url=$(cfg_get     "$config" DC_URL      "")
     keep_local=$(cfg_get "$config" KEEP_LOCAL  "true")
 
     if [[ "$tg_enabled" == "true" ]]; then
         any_enabled=true
-        send_telegram "$file" "$tg_token" "$tg_chat" "$tg_topic" || all_ok=false
+        local profile
+        profile=$(basename "$config" .conf)
+        local TG_RESOLVED_TOKEN="" TG_RESOLVED_CHAT="" TG_RESOLVED_TOPIC=""
+        resolve_telegram_credentials "$config" "$profile"
+
+        if [[ -n "$TG_RESOLVED_TOKEN" && -n "$TG_RESOLVED_CHAT" ]]; then
+            send_telegram "$file" "$TG_RESOLVED_TOKEN" "$TG_RESOLVED_CHAT" "$TG_RESOLVED_TOPIC" || all_ok=false
+        else
+            log_error "Telegram upload enabled but token or chat ID could not be resolved."
+            all_ok=false
+        fi
     fi
     if [[ "$dc_enabled" == "true" ]]; then
         any_enabled=true
@@ -1206,11 +1474,8 @@ notify_failure() {
     host_name=$(hostname 2>/dev/null || echo "server")
     ts=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date)
 
-    local tg_enabled tg_token tg_chat tg_topic dc_enabled dc_url
+    local tg_enabled dc_enabled dc_url
     tg_enabled=$(cfg_get "$config" TG_ENABLED  "false")
-    tg_token=$(cfg_get   "$config" TG_TOKEN    "")
-    tg_chat=$(cfg_get    "$config" TG_CHAT_ID  "")
-    tg_topic=$(cfg_get   "$config" TG_TOPIC_ID "")
     dc_enabled=$(cfg_get "$config" DC_ENABLED  "false")
     dc_url=$(cfg_get     "$config" DC_URL      "")
 
@@ -1220,10 +1485,14 @@ notify_failure() {
 • Time: ${ts}
 • Reason: ${reason}"
 
-    if [[ "$tg_enabled" == "true" && -n "$tg_token" && -n "$tg_chat" ]]; then
-        local args=( -s --max-time 15 --data-urlencode "chat_id=${tg_chat}" --data-urlencode "text=${alert_msg}" )
-        [[ -n "$tg_topic" ]] && args+=( --data-urlencode "message_thread_id=${tg_topic}" )
-        curl "${args[@]}" "https://api.telegram.org/bot${tg_token}/sendMessage" >/dev/null 2>&1 || true
+    if [[ "$tg_enabled" == "true" ]]; then
+        local TG_RESOLVED_TOKEN="" TG_RESOLVED_CHAT="" TG_RESOLVED_TOPIC=""
+        resolve_telegram_credentials "$config" "$profile"
+        if [[ -n "$TG_RESOLVED_TOKEN" && -n "$TG_RESOLVED_CHAT" ]]; then
+            local args=( -s --max-time 15 --data-urlencode "chat_id=${TG_RESOLVED_CHAT}" --data-urlencode "text=${alert_msg}" )
+            [[ -n "$TG_RESOLVED_TOPIC" ]] && args+=( --data-urlencode "message_thread_id=${TG_RESOLVED_TOPIC}" )
+            curl "${args[@]}" "https://api.telegram.org/bot${TG_RESOLVED_TOKEN}/sendMessage" >/dev/null 2>&1 || true
+        fi
     fi
 
     if [[ "$dc_enabled" == "true" && -n "$dc_url" ]]; then
@@ -1722,15 +1991,67 @@ precheck_disk_space() {
 # ============================================================
 
 wizard_notifications() {
-    echo -e "\n${BOLD}-- Notification Settings --------------------------------${NC}"
+    echo -e "\n${BOLD}-- Notification & Upload Settings -----------------------${NC}"
     TG_ENABLED_W=false; TG_TOKEN_W=""; TG_CHAT_W=""; TG_TOPIC_W=""
+    TG_BOT_NAME_W=""; TG_TOPIC_MODE_W=false; TG_TOPIC_GROUP_ID_W=""
     DC_ENABLED_W=false; DC_URL_W=""
 
-    if ask_yn "Enable Telegram?" "n"; then
+    if ask_yn "Enable Telegram upload / alerts?" "n"; then
         TG_ENABLED_W=true
-        TG_TOKEN_W=$(ask_secret "Bot token")
-        TG_CHAT_W=$(ask "Chat ID")
-        TG_TOPIC_W=$(ask_optional "Topic ID (supergroup thread)")
+        local bots=()
+        local b
+        for b in $(bot_list); do
+            [[ -n "$b" ]] && bots+=("$b")
+        done
+        local default_bot
+        default_bot=$(settings_get "DEFAULT_BOT" "")
+
+        if (( ${#bots[@]} > 0 )); then
+            echo -e "\n  ${BOLD}Configured Telegram Bots:${NC}"
+            local bot_choices=()
+            for b in "${bots[@]}"; do
+                local desc="$b"
+                [[ "$b" == "$default_bot" ]] && desc="${b} [Default]"
+                bot_choices+=("$desc")
+            done
+            bot_choices+=("Custom token (manual entry)")
+
+            local bot_sel
+            bot_sel=$(ask_choice "Select a Telegram bot to use" "${bot_choices[@]}")
+            if [[ "$bot_sel" == "Custom token (manual entry)" ]]; then
+                TG_TOKEN_W=$(ask_secret "Bot token")
+                TG_CHAT_W=$(ask "Chat ID (user ID, channel, or group)")
+                TG_TOPIC_W=$(ask_optional "Topic ID (optional thread ID)")
+            else
+                local chosen_bot
+                chosen_bot=$(echo "$bot_sel" | awk '{print $1}')
+                TG_BOT_NAME_W="$chosen_bot"
+                TG_TOKEN_W=$(bot_get "$chosen_bot" "TG_TOKEN" "")
+                TG_CHAT_W=$(bot_get "$chosen_bot" "TG_CHAT_ID" "")
+                TG_TOPIC_MODE_W=$(bot_get "$chosen_bot" "TG_TOPIC_MODE" "false")
+                TG_TOPIC_GROUP_ID_W=$(bot_get "$chosen_bot" "TG_TOPIC_GROUP_ID" "")
+                echo -e "  ${GREEN}✓ Using bot '${chosen_bot}'${NC}"
+                if [[ "$TG_TOPIC_MODE_W" == "true" ]]; then
+                    echo -e "  ${CYAN}ℹ Topic Mode active: Backups will be organized into topics in group ${TG_TOPIC_GROUP_ID_W}${NC}"
+                fi
+            fi
+        else
+            # Check if global default token is set in settings
+            local global_token global_chat
+            global_token=$(settings_get "DEFAULT_TG_TOKEN" "")
+            global_chat=$(settings_get "DEFAULT_TG_CHAT" "")
+            if [[ -n "$global_token" ]] && ask_yn "Use configured global default Telegram bot?" "y"; then
+                TG_TOKEN_W="$global_token"
+                TG_CHAT_W="$global_chat"
+                TG_TOPIC_MODE_W=$(settings_get "TOPIC_MODE" "false")
+                TG_TOPIC_GROUP_ID_W=$(settings_get "TOPIC_GROUP_ID" "")
+                echo -e "  ${GREEN}✓ Using global default bot${NC}"
+            else
+                TG_TOKEN_W=$(ask_secret "Bot token")
+                TG_CHAT_W=$(ask "Chat ID (user ID, channel, or group)")
+                TG_TOPIC_W=$(ask_optional "Topic ID (supergroup thread, optional)")
+            fi
+        fi
     fi
 
     if ask_yn "Enable Discord?" "n"; then
@@ -1836,6 +2157,9 @@ cmd_add() {
                 RETENTION_COUNT "$RETENTION_W" \
                 KEEP_LOCAL  "$KEEP_LOCAL_W" \
                 TG_ENABLED  "$TG_ENABLED_W" \
+                TG_BOT_NAME "$TG_BOT_NAME_W" \
+                TG_TOPIC_MODE "$TG_TOPIC_MODE_W" \
+                TG_TOPIC_GROUP_ID "$TG_TOPIC_GROUP_ID_W" \
                 TG_TOKEN    "$TG_TOKEN_W" \
                 TG_CHAT_ID  "$TG_CHAT_W" \
                 TG_TOPIC_ID "$TG_TOPIC_W" \
@@ -1881,6 +2205,9 @@ cmd_add() {
                 RETENTION_COUNT "$RETENTION_W" \
                 KEEP_LOCAL  "$KEEP_LOCAL_W" \
                 TG_ENABLED  "$TG_ENABLED_W" \
+                TG_BOT_NAME "$TG_BOT_NAME_W" \
+                TG_TOPIC_MODE "$TG_TOPIC_MODE_W" \
+                TG_TOPIC_GROUP_ID "$TG_TOPIC_GROUP_ID_W" \
                 TG_TOKEN    "$TG_TOKEN_W" \
                 TG_CHAT_ID  "$TG_CHAT_W" \
                 TG_TOPIC_ID "$TG_TOPIC_W" \
@@ -1915,6 +2242,9 @@ cmd_add() {
             RETENTION_COUNT "$RETENTION_W" \
             KEEP_LOCAL  "$KEEP_LOCAL_W" \
             TG_ENABLED  "$TG_ENABLED_W" \
+            TG_BOT_NAME "$TG_BOT_NAME_W" \
+            TG_TOPIC_MODE "$TG_TOPIC_MODE_W" \
+            TG_TOPIC_GROUP_ID "$TG_TOPIC_GROUP_ID_W" \
             TG_TOKEN    "$TG_TOKEN_W" \
             TG_CHAT_ID  "$TG_CHAT_W" \
             TG_TOPIC_ID "$TG_TOPIC_W" \
@@ -3545,6 +3875,343 @@ cmd_retention() {
 }
 
 # ============================================================
+#  COMMAND: settings / bot
+# ============================================================
+
+cmd_bot_list() {
+    local bots=()
+    local b
+    for b in $(bot_list); do
+        [[ -n "$b" ]] && bots+=("$b")
+    done
+    local def_bot
+    def_bot=$(settings_get "DEFAULT_BOT" "")
+
+    echo -e "\n${BOLD}${CYAN}Archiver Configured Telegram Bots:${NC}\n"
+    if (( ${#bots[@]} == 0 )); then
+        echo -e "  ${YELLOW}No bots configured yet.${NC}"
+        echo -e "  Add a bot with:  ${BOLD}archiver bot add [name]${NC}  or  ${BOLD}archiver settings${NC}\n"
+        return 0
+    fi
+
+    printf "  ${BOLD}%-15s %-20s %-12s %-10s${NC}\n" "NAME" "CHAT/GROUP ID" "TOPIC MODE" "STATUS"
+    printf "  %-15s %-20s %-12s %-10s\n" "---------------" "--------------------" "------------" "----------"
+    for b in "${bots[@]}"; do
+        local token chat topic_mode group_id status="configured"
+        token=$(bot_get "$b" "TG_TOKEN" "")
+        chat=$(bot_get "$b" "TG_CHAT_ID" "")
+        topic_mode=$(bot_get "$b" "TG_TOPIC_MODE" "false")
+        group_id=$(bot_get "$b" "TG_TOPIC_GROUP_ID" "")
+
+        local chat_disp="$chat"
+        [[ "$topic_mode" == "true" && -n "$group_id" ]] && chat_disp="$group_id"
+
+        local label="$b"
+        [[ "$b" == "$def_bot" ]] && label="${b} *"
+        printf "  %-15s %-20s %-12s %-10s\n" "$label" "${chat_disp:-<none>}" "$topic_mode" "$status"
+    done
+    [[ -n "$def_bot" ]] && echo -e "\n  ${CYAN}(* = Default bot for all backups)${NC}\n" || echo ""
+}
+
+cmd_bot_add() {
+    local bname="${1:-}"
+    if [[ -z "$bname" ]]; then
+        bname=$(ask "Bot identifier name (e.g. main, backup_bot, prod)")
+    fi
+    bname=$(trim "$bname" | tr -c 'A-Za-z0-9_-' '_')
+    [[ -z "$bname" ]] && { echo -e "${RED}Invalid bot name.${NC}"; return 1; }
+
+    local token chat topic_mode="false" group_id=""
+    token=$(ask_secret "Bot token (from @BotFather)")
+    [[ -z "$token" ]] && { echo -e "${RED}Token cannot be empty.${NC}"; return 1; }
+
+    chat=$(ask "Default Telegram Chat ID (user ID, group, or channel)")
+
+    if ask_yn "Enable Topic Mode (Forum Supergroup) for this bot?" "n"; then
+        topic_mode="true"
+        group_id=$(ask "Numerical Supergroup Chat ID (e.g. -1001234567890)" "$chat")
+        echo -e "  ${CYAN}ℹ Topic Mode enabled. Ensure the bot is an admin with 'Manage Topics' permission.${NC}"
+    fi
+
+    bot_save "$bname" "$token" "$chat" "$topic_mode" "$group_id"
+    echo -e "${GREEN}[OK] Bot '${bname}' saved successfully.${NC}"
+
+    local def_bot
+    def_bot=$(settings_get "DEFAULT_BOT" "")
+    if [[ -z "$def_bot" ]] || ask_yn "Set '${bname}' as the default bot for all backups?" "y"; then
+        settings_set "DEFAULT_BOT" "$bname"
+        settings_set "DEFAULT_TG_TOKEN" "$token"
+        settings_set "DEFAULT_TG_CHAT" "$chat"
+        [[ "$topic_mode" == "true" ]] && settings_set "TOPIC_MODE" "true"
+        [[ -n "$group_id" ]] && settings_set "TOPIC_GROUP_ID" "$group_id"
+        echo -e "${GREEN}[OK] '${bname}' set as default bot.${NC}"
+    fi
+
+    if ask_yn "Test this bot connection now?" "y"; then
+        cmd_bot_test "$bname"
+    fi
+}
+
+cmd_bot_remove() {
+    local bname="${1:-}"
+    if [[ -z "$bname" ]]; then
+        local bots=()
+        local b
+        for b in $(bot_list); do
+            [[ -n "$b" ]] && bots+=("$b")
+        done
+        if (( ${#bots[@]} == 0 )); then
+            echo -e "${YELLOW}No bots to remove.${NC}"
+            return 0
+        fi
+        bname=$(ask_choice "Select bot to remove" "${bots[@]}")
+    fi
+
+    if [[ -n "$bname" ]]; then
+        bot_delete "$bname"
+        echo -e "${GREEN}[OK] Bot '${bname}' removed.${NC}"
+    fi
+}
+
+cmd_bot_default() {
+    local bname="${1:-}"
+    if [[ -z "$bname" ]]; then
+        local bots=()
+        local b
+        for b in $(bot_list); do
+            [[ -n "$b" ]] && bots+=("$b")
+        done
+        if (( ${#bots[@]} == 0 )); then
+            echo -e "${YELLOW}No bots configured yet. Use: archiver bot add${NC}"
+            return 0
+        fi
+        bname=$(ask_choice "Select default bot" "${bots[@]}")
+    fi
+
+    if [[ -n "$bname" && -f "$(bot_file "$bname")" ]]; then
+        settings_set "DEFAULT_BOT" "$bname"
+        local token chat topic_mode group_id
+        token=$(bot_get "$bname" "TG_TOKEN" "")
+        chat=$(bot_get "$bname" "TG_CHAT_ID" "")
+        topic_mode=$(bot_get "$bname" "TG_TOPIC_MODE" "false")
+        group_id=$(bot_get "$bname" "TG_TOPIC_GROUP_ID" "")
+        settings_set "DEFAULT_TG_TOKEN" "$token"
+        settings_set "DEFAULT_TG_CHAT" "$chat"
+        settings_set "TOPIC_MODE" "$topic_mode"
+        settings_set "TOPIC_GROUP_ID" "$group_id"
+        echo -e "${GREEN}[OK] Default bot updated to: ${BOLD}${bname}${NC}"
+    else
+        echo -e "${RED}Bot not found: ${bname}${NC}"
+        return 1
+    fi
+}
+
+cmd_bot_test() {
+    local bname="${1:-}"
+    if [[ -z "$bname" ]]; then
+        bname=$(settings_get "DEFAULT_BOT" "")
+    fi
+    if [[ -z "$bname" ]]; then
+        local bots=()
+        local b
+        for b in $(bot_list); do
+            [[ -n "$b" ]] && bots+=("$b")
+        done
+        if (( ${#bots[@]} == 0 )); then
+            echo -e "${YELLOW}No bots configured yet. Use: archiver bot add${NC}"
+            return 0
+        fi
+        bname=$(ask_choice "Select bot to test" "${bots[@]}")
+    fi
+
+    local token chat topic_mode group_id
+    token=$(bot_get "$bname" "TG_TOKEN" "")
+    chat=$(bot_get "$bname" "TG_CHAT_ID" "")
+    topic_mode=$(bot_get "$bname" "TG_TOPIC_MODE" "false")
+    group_id=$(bot_get "$bname" "TG_TOPIC_GROUP_ID" "")
+
+    if [[ -z "$token" ]]; then
+        echo -e "${RED}Error: Token is empty for bot '${bname}'.${NC}"
+        return 1
+    fi
+
+    echo -e "\n${BOLD}Testing Bot: ${CYAN}${bname}${NC} ..."
+    local resp
+    resp=$(curl -fsSL --max-time 15 "https://api.telegram.org/bot${token}/getMe" 2>&1 || true)
+    if echo "$resp" | grep -q '"ok":[[:space:]]*true'; then
+        local b_user b_first
+        b_user=$(echo "$resp" | grep -oE '"username":[[:space:]]*"[^"]+"' | cut -d'"' -f4 || echo "unknown")
+        b_first=$(echo "$resp" | grep -oE '"first_name":[[:space:]]*"[^"]+"' | cut -d'"' -f4 || echo "Bot")
+        echo -e "  ${GREEN}[PASS] Connection OK:${NC} ${b_first} (@${b_user})"
+    else
+        echo -e "  ${RED}[FAIL] Could not verify bot token via getMe.${NC}"
+        echo "  Response: $resp"
+        return 1
+    fi
+
+    # Check Topic Mode test if enabled
+    if [[ "$topic_mode" == "true" && -n "$group_id" ]]; then
+        echo -e "\n${BOLD}Testing Topic Mode in Group ${CYAN}${group_id}${NC} ..."
+        local test_topic
+        test_topic="$(get_topic_name "healthcheck")"
+        echo -e "  Attempting to create forum topic: ${BOLD}${test_topic}${NC} ..."
+        local tid
+        tid=$(telegram_create_topic "$token" "$group_id" "$test_topic")
+        if [[ -n "$tid" ]]; then
+            echo -e "  ${GREEN}[PASS] Topic created successfully! (Thread ID: ${tid})${NC}"
+            local send_res
+            send_res=$(curl -fsSL --max-time 15 -X POST "https://api.telegram.org/bot${token}/sendMessage" \
+                -d "chat_id=${group_id}" \
+                -d "message_thread_id=${tid}" \
+                --data-urlencode "text=Archiver Topic Mode connectivity verified! Server: $(hostname)" 2>&1 || true)
+            if echo "$send_res" | grep -q '"ok":[[:space:]]*true'; then
+                echo -e "  ${GREEN}[PASS] Verified posting into topic thread!${NC}"
+            fi
+        else
+            echo -e "  ${YELLOW}[WARN] Could not create topic in group ${group_id}.${NC}"
+            echo -e "  Please ensure the group has 'Topics' enabled and the bot is an Administrator with 'Manage Topics'."
+        fi
+    elif [[ -n "$chat" ]]; then
+        echo -e "\n${BOLD}Testing chat access to ${chat} ...${NC}"
+        doctor_check_telegram "$token" "$chat" ""
+    fi
+    echo ""
+}
+
+cmd_bot() {
+    local sub="${1:-list}"
+    shift || true
+    case "$sub" in
+        list) cmd_bot_list ;;
+        add)  cmd_bot_add "$@" ;;
+        remove|delete|rm) cmd_bot_remove "$@" ;;
+        default) cmd_bot_default "$@" ;;
+        test) cmd_bot_test "$@" ;;
+        help|-h|--help)
+            echo "Usage: archiver bot [list|add|remove|default|test]"
+            ;;
+        *)
+            echo -e "${RED}Unknown bot subcommand: ${sub}${NC}"
+            echo "Usage: archiver bot [list|add|remove|default|test]"
+            return 1
+            ;;
+    esac
+}
+
+_settings_manage_bots() {
+    while true; do
+        echo -e "\n${BOLD}Manage Telegram Bots:${NC}"
+        echo -e "  ${BOLD}1)${NC} List configured bots"
+        echo -e "  ${BOLD}2)${NC} Add a new bot"
+        echo -e "  ${BOLD}3)${NC} Remove a bot"
+        echo -e "  ${BOLD}4)${NC} Test a bot"
+        echo -e "  ${BOLD}5)${NC} Back to main settings"
+        echo ""
+
+        local b_opt
+        b_opt=$(_read_line "Enter choice [1-5]: ")
+        b_opt=$(trim "$b_opt")
+        case "$b_opt" in
+            1) cmd_bot_list ;;
+            2) cmd_bot_add ;;
+            3) cmd_bot_remove ;;
+            4) cmd_bot_test ;;
+            5|q|exit|"") break ;;
+            *) echo -e "  ${RED}Invalid choice.${NC}" ;;
+        esac
+    done
+}
+
+_settings_set_default_bot() {
+    cmd_bot_default
+}
+
+_settings_configure_topic_mode() {
+    echo -e "\n${BOLD}${CYAN}Telegram Topic Mode Configuration${NC}\n"
+    local cur_mode cur_group
+    cur_mode=$(settings_get "TOPIC_MODE" "false")
+    cur_group=$(settings_get "TOPIC_GROUP_ID" "")
+
+    echo -e "Topic Mode automatically organizes backups by server and profile in a Telegram Supergroup forum."
+    echo -e "Topic Name Format: ${BOLD}$(get_topic_name "<profile>")${NC}"
+    echo -e "Current Status:    ${BOLD}${cur_mode}${NC}"
+    [[ -n "$cur_group" ]] && echo -e "Supergroup ID:     ${BOLD}${cur_group}${NC}"
+    echo ""
+
+    if [[ "$cur_mode" == "true" ]]; then
+        if ask_yn "Topic Mode is currently ENABLED. Do you want to disable it?" "n"; then
+            settings_set "TOPIC_MODE" "false"
+            echo -e "${GREEN}[OK] Topic Mode disabled.${NC}"
+            return 0
+        fi
+        local new_grp
+        new_grp=$(ask "Update Supergroup Chat ID" "$cur_group")
+        [[ -n "$new_grp" ]] && settings_set "TOPIC_GROUP_ID" "$new_grp"
+        echo -e "${GREEN}[OK] Supergroup ID updated to: ${new_grp}${NC}"
+    else
+        if ask_yn "Enable Telegram Topic Mode now?" "y"; then
+            local grp
+            grp=$(ask "Numerical Supergroup Chat ID (e.g. -1001234567890)")
+            [[ -z "$grp" ]] && { echo -e "${RED}Chat ID cannot be empty.${NC}"; return 1; }
+            settings_set "TOPIC_MODE" "true"
+            settings_set "TOPIC_GROUP_ID" "$grp"
+            echo -e "${GREEN}[OK] Topic Mode enabled with Supergroup ID: ${grp}${NC}"
+            echo -e "${YELLOW}Important:${NC} Ensure your bot is an Administrator with 'Manage Topics' permission in this group."
+        fi
+    fi
+}
+
+_settings_view() {
+    echo -e "\n${BOLD}${CYAN}══════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${CYAN}  Current Archiver Global Settings        ${NC}"
+    echo -e "${BOLD}${CYAN}══════════════════════════════════════════${NC}\n"
+
+    local def_bot topic_mode topic_grp
+    def_bot=$(settings_get "DEFAULT_BOT" "<not set>")
+    topic_mode=$(settings_get "TOPIC_MODE" "false")
+    topic_grp=$(settings_get "TOPIC_GROUP_ID" "<not set>")
+
+    echo -e "  ${BOLD}Default Bot:${NC}         $def_bot"
+    echo -e "  ${BOLD}Topic Mode:${NC}          $topic_mode"
+    echo -e "  ${BOLD}Supergroup ID:${NC}       $topic_grp"
+    echo -e "  ${BOLD}Topic Name Preview:${NC}  $(get_topic_name "db_mysite")"
+    echo -e "  ${BOLD}Settings File:${NC}       $SETTINGS_FILE"
+    echo -e "  ${BOLD}Bots Directory:${NC}      $BOTS_DIR"
+
+    cmd_bot_list
+}
+
+cmd_settings() {
+    echo -e "\n${BOLD}${CYAN}╔══════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${CYAN}║         Archiver Global Settings         ║${NC}"
+    echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════╝${NC}\n"
+
+    while true; do
+        echo -e "${BOLD}Select a settings option:${NC}"
+        echo -e "  ${BOLD}1)${NC} Manage Telegram Bots (Add / Remove / List)"
+        echo -e "  ${BOLD}2)${NC} Set Default Telegram Bot"
+        echo -e "  ${BOLD}3)${NC} Configure Telegram Topic Mode (Forum Supergroups)"
+        echo -e "  ${BOLD}4)${NC} Test Telegram Bot & Topic Creation"
+        echo -e "  ${BOLD}5)${NC} View Current Settings"
+        echo -e "  ${BOLD}6)${NC} Exit"
+        echo ""
+
+        local choice
+        choice=$(_read_line "Enter choice [1-6]: ")
+        choice=$(trim "$choice")
+        case "$choice" in
+            1) _settings_manage_bots ;;
+            2) _settings_set_default_bot ;;
+            3) _settings_configure_topic_mode ;;
+            4) cmd_bot_test ;;
+            5) _settings_view ;;
+            6|q|exit|"") break ;;
+            *) echo -e "  ${RED}Invalid choice.${NC}\n" ;;
+        esac
+    done
+}
+
+# ============================================================
 #  COMMAND: update / update-check
 # ============================================================
 
@@ -3741,6 +4408,9 @@ ${BOLD}COMMANDS${NC}
 
   ${CYAN}retention${NC} [profile] [--count N]
                           Enforce backup retention policy and remove old backups
+  ${CYAN}settings${NC}                Manage global settings, bots, and Topic Mode
+  ${CYAN}bot${NC} [list|add|remove|default|test]
+                          Manage Telegram bots
   ${CYAN}version${NC}                 Show version
   ${CYAN}update${NC}                  Update Archiver to latest version safely
   ${CYAN}update-check${NC}            Check for updates
@@ -3778,6 +4448,8 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         export)         cmd_export "$@" ;;
         import)         cmd_import "$@" ;;
         retention|cleanup) cmd_retention "$@" ;;
+        settings|config) cmd_settings "$@" ;;
+        bot|bots)       cmd_bot "$@" ;;
         version|-v|--version) cmd_version ;;
         update|upgrade) cmd_update "$@" ;;
         update-check)   cmd_update_check ;;
