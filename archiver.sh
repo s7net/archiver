@@ -1739,10 +1739,16 @@ wizard_retention() {
     [[ "$r" =~ ^[0-9]+$ ]] || r=10
     RETENTION_W="$r"
     KEEP_LOCAL_W="true"
-    if ask_yn "Keep local copy of backup after remote upload?" "y"; then
-        KEEP_LOCAL_W="true"
-    else
-        KEEP_LOCAL_W="false"
+
+    # Only ask about keeping local copies if Telegram or Discord upload is actually enabled
+    if [[ "${TG_ENABLED_W:-false}" == "true" || "${DC_ENABLED_W:-false}" == "true" ]]; then
+        echo -e "  ${CYAN}(Remote upload is enabled. You can keep local copies on disk or delete them after upload to save space.)${NC}"
+        if ask_yn "Keep local copy on server after uploading to Telegram/Discord?" "y"; then
+            KEEP_LOCAL_W="true"
+        else
+            KEEP_LOCAL_W="false"
+            echo -e "  ${YELLOW}Notice: Backups will only be kept in Telegram/Discord and deleted from local disk immediately.${NC}"
+        fi
     fi
 }
 
@@ -1773,8 +1779,8 @@ cmd_add() {
 
     wizard_compression
     wizard_encryption
-    wizard_retention
     wizard_notifications
+    wizard_retention
 
     local profile config_file
 
