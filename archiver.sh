@@ -3514,6 +3514,26 @@ cmd_retention() {
 #  COMMAND: update / update-check
 # ============================================================
 
+version_gt() {
+    [[ "$1" == "$2" ]] && return 1
+    local IFS=.
+    local i ver1=($1) ver2=($2)
+    for ((i=0; i<${#ver1[@]} || i<${#ver2[@]}; i++)); do
+        local v1="${ver1[i]:-0}"
+        local v2="${ver2[i]:-0}"
+        v1="${v1//[!0-9]/}"
+        v2="${v2//[!0-9]/}"
+        [[ -z "$v1" ]] && v1=0
+        [[ -z "$v2" ]] && v2=0
+        if ((10#$v1 > 10#$v2)); then
+            return 0
+        elif ((10#$v1 < 10#$v2)); then
+            return 1
+        fi
+    done
+    return 1
+}
+
 cmd_update_check() {
     echo -e "\n${BOLD}Archiver Update Check${NC}\n"
     echo "Current version: v$ARCHIVER_VERSION"
@@ -3533,14 +3553,16 @@ cmd_update_check() {
         return 0
     fi
 
-    if [[ "$remote_ver" != "$ARCHIVER_VERSION" ]]; then
+    if [[ "$remote_ver" == "$ARCHIVER_VERSION" ]]; then
+        echo -e "${GREEN}You are already using the latest version (v${ARCHIVER_VERSION}).${NC}"
+    elif version_gt "$remote_ver" "$ARCHIVER_VERSION"; then
         echo -e "${GREEN}New version available: v${remote_ver}${NC}\n"
         echo "To update to the latest version, run:"
         echo "  archiver update"
         echo "or re-run the installer:"
         echo "  curl -fsSL https://raw.githubusercontent.com/s7net/archiver/refs/heads/main/install.sh | bash"
     else
-        echo -e "${GREEN}You are already using the latest version (v${ARCHIVER_VERSION}).${NC}"
+        echo -e "${GREEN}You are on the latest or development version (v${ARCHIVER_VERSION} >= v${remote_ver}).${NC}"
     fi
 }
 
@@ -3614,7 +3636,7 @@ cmd_update() {
     [[ -z "$new_ver" ]] && new_ver="latest"
 
     # Check if already on latest version unless force flag provided
-    if [[ "$new_ver" == "$ARCHIVER_VERSION" && "${1:-}" != "--force" && "${1:-}" != "-f" ]]; then
+    if ! version_gt "$new_ver" "$ARCHIVER_VERSION" && [[ "${1:-}" != "--force" && "${1:-}" != "-f" ]]; then
         rm -f "$tmp_bin" 2>/dev/null || true
         echo -e "${GREEN}[OK]${NC} Archiver is already up to date (${BOLD}v${ARCHIVER_VERSION}${NC})."
         echo -e "     (To force reinstall anyway, run: ${BOLD}archiver update --force${NC})"
