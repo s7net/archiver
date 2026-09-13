@@ -4235,17 +4235,33 @@ version_gt() {
     return 1
 }
 
+_get_github_raw_url() {
+    local file="${1:-archiver.sh}"
+    local sha=""
+    if command -v curl &>/dev/null; then
+        sha=$(curl -fsSL -H "Accept: application/vnd.github.v3+json" -H "Cache-Control: no-cache" --max-time 5 "https://api.github.com/repos/s7net/archiver/commits/main" 2>/dev/null | grep -m1 '"sha":' | cut -d'"' -f4 || true)
+    elif command -v wget &>/dev/null; then
+        sha=$(wget -qO- --header="Accept: application/vnd.github.v3+json" --header="Cache-Control: no-cache" --timeout=5 "https://api.github.com/repos/s7net/archiver/commits/main" 2>/dev/null | grep -m1 '"sha":' | cut -d'"' -f4 || true)
+    fi
+    if [[ -n "$sha" && ${#sha} -ge 40 ]]; then
+        echo "https://raw.githubusercontent.com/s7net/archiver/${sha}/${file}"
+    else
+        echo "https://raw.githubusercontent.com/s7net/archiver/main/${file}"
+    fi
+}
+
 cmd_update_check() {
     echo -e "\n${BOLD}Archiver Update Check${NC}\n"
     echo "Current version: v$ARCHIVER_VERSION"
     echo ""
     echo -n "Checking GitHub repository (https://github.com/s7net/archiver)... "
     local remote_ver=""
-    local check_url="https://raw.githubusercontent.com/s7net/archiver/refs/heads/main/archiver.sh"
+    local check_url
+    check_url="$(_get_github_raw_url "archiver.sh")"
     if command -v curl &>/dev/null; then
-        remote_ver=$(curl -fsSL --max-time 8 "$check_url" 2>/dev/null | grep -m1 '^ARCHIVER_VERSION=' | cut -d'"' -f2 || true)
+        remote_ver=$(curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" --max-time 8 "$check_url" 2>/dev/null | grep -m1 '^ARCHIVER_VERSION=' | cut -d'"' -f2 || true)
     elif command -v wget &>/dev/null; then
-        remote_ver=$(wget -qO- --timeout=8 "$check_url" 2>/dev/null | grep -m1 '^ARCHIVER_VERSION=' | cut -d'"' -f2 || true)
+        remote_ver=$(wget -qO- --header="Cache-Control: no-cache" --header="Pragma: no-cache" --timeout=8 "$check_url" 2>/dev/null | grep -m1 '^ARCHIVER_VERSION=' | cut -d'"' -f2 || true)
     fi
 
     if [[ -z "$remote_ver" ]]; then
@@ -4261,7 +4277,7 @@ cmd_update_check() {
         echo "To update to the latest version, run:"
         echo "  archiver update"
         echo "or re-run the installer:"
-        echo "  curl -fsSL https://raw.githubusercontent.com/s7net/archiver/refs/heads/main/install.sh | bash"
+        echo "  curl -fsSL https://raw.githubusercontent.com/s7net/archiver/main/install.sh | bash"
     else
         echo -e "${GREEN}You are on the latest or development version (v${ARCHIVER_VERSION} >= v${remote_ver}).${NC}"
     fi
@@ -4294,7 +4310,8 @@ cmd_update() {
     fi
 
     local tmp_bin="${BACKUP_TMP}/archiver_update.$$"
-    local update_url="https://raw.githubusercontent.com/s7net/archiver/refs/heads/main/archiver.sh"
+    local update_url
+    update_url="$(_get_github_raw_url "archiver.sh")"
     local dl_ok=false
 
     echo -e "${CYAN}[INFO]${NC} Target binary     : ${BOLD}${self_bin}${NC}"
@@ -4302,9 +4319,9 @@ cmd_update() {
     echo -e "${CYAN}[INFO]${NC} Downloading latest Archiver from GitHub..."
 
     if command -v curl &>/dev/null; then
-        curl -fsSL --max-time 60 "$update_url" -o "$tmp_bin" && dl_ok=true || dl_ok=false
+        curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" --max-time 60 "$update_url" -o "$tmp_bin" && dl_ok=true || dl_ok=false
     elif command -v wget &>/dev/null; then
-        wget -q --timeout=60 "$update_url" -O "$tmp_bin" && dl_ok=true || dl_ok=false
+        wget -q --header="Cache-Control: no-cache" --header="Pragma: no-cache" --timeout=60 "$update_url" -O "$tmp_bin" && dl_ok=true || dl_ok=false
     fi
 
     if [[ "$dl_ok" != "true" || ! -s "$tmp_bin" ]]; then

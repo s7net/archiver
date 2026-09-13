@@ -13,7 +13,7 @@
 set -uo pipefail
 
 ARCHIVER_VERSION="1.0.2"
-REPO_URL="https://raw.githubusercontent.com/s7net/archiver/refs/heads/main/archiver.sh"
+REPO_URL="https://raw.githubusercontent.com/s7net/archiver/main/archiver.sh"
 SCRIPT_NAME="archiver"
 
 # ── Colors ────────────────────────────────────────────────────
@@ -196,6 +196,21 @@ on_install_interrupt() {
 trap cleanup_staging EXIT
 trap on_install_interrupt INT TERM
 
+_get_github_raw_url() {
+    local file="${1:-archiver.sh}"
+    local sha=""
+    if command -v curl &>/dev/null; then
+        sha=$(curl -fsSL -H "Accept: application/vnd.github.v3+json" -H "Cache-Control: no-cache" --max-time 5 "https://api.github.com/repos/s7net/archiver/commits/main" 2>/dev/null | grep -m1 '"sha":' | cut -d'"' -f4 || true)
+    elif command -v wget &>/dev/null; then
+        sha=$(wget -qO- --header="Accept: application/vnd.github.v3+json" --header="Cache-Control: no-cache" --timeout=5 "https://api.github.com/repos/s7net/archiver/commits/main" 2>/dev/null | grep -m1 '"sha":' | cut -d'"' -f4 || true)
+    fi
+    if [[ -n "$sha" && ${#sha} -ge 40 ]]; then
+        echo "https://raw.githubusercontent.com/s7net/archiver/${sha}/${file}"
+    else
+        echo "https://raw.githubusercontent.com/s7net/archiver/main/${file}"
+    fi
+}
+
 _download_or_copy() {
     local target="$1"
     local self_dir
@@ -210,11 +225,14 @@ _download_or_copy() {
 
     info "Downloading from GitHub ..."
 
+    local download_url
+    download_url="$(_get_github_raw_url "archiver.sh")"
+
     if command -v curl &>/dev/null; then
-        curl -fsSL --max-time 60 "$REPO_URL" -o "$target" \
+        curl -fsSL -H "Cache-Control: no-cache" -H "Pragma: no-cache" --max-time 60 "$download_url" -o "$target" \
             || die "Download failed. Check your connection, or place archiver.sh next to install.sh and re-run."
     elif command -v wget &>/dev/null; then
-        wget -q --timeout=60 "$REPO_URL" -O "$target" \
+        wget -q --header="Cache-Control: no-cache" --header="Pragma: no-cache" --timeout=60 "$download_url" -O "$target" \
             || die "Download failed. Check your connection, or place archiver.sh next to install.sh and re-run."
     else
         die "Neither curl nor wget is available. Place archiver.sh next to install.sh and re-run."
