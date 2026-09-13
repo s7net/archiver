@@ -7,7 +7,7 @@
 
 set -uo pipefail
 
-ARCHIVER_VERSION="1.0.0"
+ARCHIVER_VERSION="1.0.1"
 
 ARCHIVER_HOME="${ARCHIVER_HOME:-$HOME/.archiver}"
 CONFIGS_DIR="${ARCHIVER_HOME}/configs"
@@ -3518,9 +3518,15 @@ cmd_update_check() {
     echo -e "\n${BOLD}Archiver Update Check${NC}\n"
     echo "Current version: v$ARCHIVER_VERSION"
     echo ""
-    echo -n "Checking GitHub repository... "
-    local remote_ver
-    remote_ver=$(curl -fsSL --max-time 6 "https://raw.githubusercontent.com/s7net/archiver/refs/heads/main/archiver.sh" 2>/dev/null | grep -m1 '^ARCHIVER_VERSION=' | cut -d'"' -f2 || true)
+    echo -n "Checking GitHub repository (https://github.com/s7net/archiver)... "
+    local remote_ver=""
+    local check_url="https://raw.githubusercontent.com/s7net/archiver/refs/heads/main/archiver.sh"
+    if command -v curl &>/dev/null; then
+        remote_ver=$(curl -fsSL --max-time 8 "$check_url" 2>/dev/null | grep -m1 '^ARCHIVER_VERSION=' | cut -d'"' -f2 || true)
+    elif command -v wget &>/dev/null; then
+        remote_ver=$(wget -qO- --timeout=8 "$check_url" 2>/dev/null | grep -m1 '^ARCHIVER_VERSION=' | cut -d'"' -f2 || true)
+    fi
+
     if [[ -z "$remote_ver" ]]; then
         echo -e "${YELLOW}Could not check online version (offline or unreachable).${NC}"
         echo "Repository: https://github.com/s7net/archiver"
@@ -3539,7 +3545,7 @@ cmd_update_check() {
 }
 
 cmd_update() {
-    echo -e "\n${BOLD}Archiver Safe Self-Update${NC}\n"
+    echo -e "\n${BOLD}${CYAN}Archiver Safe Self-Update${NC}\n"
     echo "Current version: v$ARCHIVER_VERSION"
 
     local self_bin
@@ -3548,16 +3554,39 @@ cmd_update() {
         self_bin="$0"
     fi
 
+    # Resolve to absolute canonical path if possible
+    if [[ -f "$self_bin" ]]; then
+        local bin_dir
+        bin_dir="$(cd "$(dirname "$self_bin")" 2>/dev/null && pwd)"
+        self_bin="${bin_dir}/$(basename "$self_bin")"
+    fi
+
+    # Verify write permissions to destination binary and directory
     if [[ ! -w "$self_bin" && ! -w "$(dirname "$self_bin")" ]]; then
-        error "Cannot write to $self_bin. Try running with sudo if installed system-wide."
+        error "Cannot write to $self_bin (permission denied)."
+        if [[ "$(id -u)" -ne 0 ]]; then
+            echo -e "  ${YELLOW}Please run update with sudo:${NC}  ${BOLD}sudo archiver update${NC}"
+        fi
         return 1
     fi
 
     local tmp_bin="${BACKUP_TMP}/archiver_update.$$"
+    local update_url="https://raw.githubusercontent.com/s7net/archiver/refs/heads/main/archiver.sh"
+    local dl_ok=false
+
+    echo -e "${CYAN}[INFO]${NC} Target binary     : ${BOLD}${self_bin}${NC}"
+    echo -e "${CYAN}[INFO]${NC} Source repository : ${BOLD}https://github.com/s7net/archiver${NC}"
     echo -e "${CYAN}[INFO]${NC} Downloading latest Archiver from GitHub..."
-    if ! curl -fsSL --max-time 60 "https://raw.githubusercontent.com/s7net/archiver/refs/heads/main/archiver.sh" -o "$tmp_bin"; then
+
+    if command -v curl &>/dev/null; then
+        curl -fsSL --max-time 60 "$update_url" -o "$tmp_bin" && dl_ok=true || dl_ok=false
+    elif command -v wget &>/dev/null; then
+        wget -q --timeout=60 "$update_url" -O "$tmp_bin" && dl_ok=true || dl_ok=false
+    fi
+
+    if [[ "$dl_ok" != "true" || ! -s "$tmp_bin" ]]; then
         rm -f "$tmp_bin" 2>/dev/null || true
-        error "Download failed. Check your internet connection."
+        error "Download failed from $update_url. Please check your internet connection."
         return 1
     fi
 
@@ -3581,14 +3610,30 @@ cmd_update() {
     fi
 
     local new_ver
-    new_ver=$("$tmp_bin" version 2>/dev/null | awk '{print $NF}' || echo "latest")
+    new_ver=$("$tmp_bin" version 2>/dev/null | awk '{print $NF}' | tr -d 'v' || echo "")
+    [[ -z "$new_ver" ]] && new_ver="latest"
 
+    # Check if already on latest version unless force flag provided
+    if [[ "$new_ver" == "$ARCHIVER_VERSION" && "${1:-}" != "--force" && "${1:-}" != "-f" ]]; then
+        rm -f "$tmp_bin" 2>/dev/null || true
+        echo -e "${GREEN}[OK]${NC} Archiver is already up to date (${BOLD}v${ARCHIVER_VERSION}${NC})."
+        echo -e "     (To force reinstall anyway, run: ${BOLD}archiver update --force${NC})"
+        return 0
+    fi
+
+    # Create safe backup of existing binary
     cp -p "$self_bin" "${self_bin}.bak" 2>/dev/null || true
+
+    # Atomically replace executable
     if mv -f "$tmp_bin" "$self_bin"; then
         chmod 755 "$self_bin"
-        echo -e "${GREEN}[OK]${NC} Successfully updated Archiver to ${BOLD}${new_ver}${NC}!"
-        echo -e "${GREEN}[OK]${NC} All configs, backups, and schedules in ~/.archiver were preserved."
-        [[ -f "${self_bin}.bak" ]] && echo -e "     Previous binary backed up to: ${self_bin}.bak"
+        echo -e "\n${BOLD}${GREEN}══════════════════════════════════════════${NC}"
+        echo -e "${BOLD}${GREEN}  Archiver successfully updated!         ${NC}"
+        echo -e "${BOLD}${GREEN}══════════════════════════════════════════${NC}"
+        echo -e "  ${BOLD}New version :${NC} v${new_ver}"
+        echo -e "  ${BOLD}Executable  :${NC} ${self_bin}"
+        [[ -f "${self_bin}.bak" ]] && echo -e "  ${BOLD}Backup saved:${NC} ${self_bin}.bak"
+        echo -e "\n  ${GREEN}✓${NC} All configs, archives, and schedules in ~/.archiver remained safe and untouched."
     else
         rm -f "$tmp_bin" 2>/dev/null || true
         error "Failed to replace executable at $self_bin."
@@ -3678,7 +3723,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         import)         cmd_import "$@" ;;
         retention|cleanup) cmd_retention "$@" ;;
         version|-v|--version) cmd_version ;;
-        update)         cmd_update "$@" ;;
+        update|upgrade) cmd_update "$@" ;;
         update-check)   cmd_update_check ;;
         help|-h|--help|*) cmd_help ;;
     esac

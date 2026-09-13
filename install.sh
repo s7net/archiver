@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-#  Archiver Installer v1.0.0
+#  Archiver Installer v1.0.1
 #  https://github.com/s7net/archiver
 #
 #  - Installs to ~/bin  (jailed shell / cPanel / DirectAdmin)
@@ -12,7 +12,7 @@
 
 set -uo pipefail
 
-ARCHIVER_VERSION="1.0.0"
+ARCHIVER_VERSION="1.0.1"
 REPO_URL="https://raw.githubusercontent.com/s7net/archiver/refs/heads/main/archiver.sh"
 SCRIPT_NAME="archiver"
 

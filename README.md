@@ -28,6 +28,20 @@ That's it. The installer will:
 
 > Works in jailed shell environments (cPanel, DirectAdmin) without root access.
 
+### Updating Archiver
+
+You can update Archiver at any time directly from the CLI or via a single curl command:
+
+```bash
+# Method 1: Built-in update command
+archiver update
+
+# Method 2: One-liner updater from GitHub
+curl -fsSL https://raw.githubusercontent.com/s7net/archiver/refs/heads/main/install.sh | bash
+```
+
+> **Safe Update Guarantee:** Updating Archiver updates only the executable binary. All your existing backup profiles, credentials, archives, logs, and cron jobs in `~/.archiver` are strictly preserved and untouched. A backup of the previous binary is saved as `archiver.bak`.
+
 ### If `archiver` is not found after install
 
 Add this to your `~/.bashrc` or `~/.profile` and reload:
