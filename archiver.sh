@@ -500,7 +500,7 @@ cfg_validate() {
 
 _read_line() {
     local prompt="$1" secret="${2:-false}"
-    local input=""
+    local input="" rc=0
     local has_tty=false
     if [[ -r /dev/tty && -w /dev/tty && -t 0 ]]; then
         has_tty=true
@@ -508,18 +508,24 @@ _read_line() {
 
     if [[ "$has_tty" == "true" ]]; then
         if [[ "$secret" == "true" ]]; then
-            IFS= read -r -s -p "$prompt" input </dev/tty
+            IFS= read -r -s -p "$prompt" input </dev/tty || rc=$?
             echo >/dev/tty
         else
-            IFS= read -r -p "$prompt" input </dev/tty
+            IFS= read -r -p "$prompt" input </dev/tty || rc=$?
         fi
     else
         if [[ "$secret" == "true" ]]; then
-            IFS= read -r -s input || input=""
+            IFS= read -r -s input || rc=$?
         else
             echo -ne "$prompt" >&2
-            IFS= read -r input || input=""
+            IFS= read -r input || rc=$?
         fi
+    fi
+
+    if (( rc != 0 )); then
+        # Cancelled via Ctrl+C or EOF (Ctrl+D)
+        kill -s INT $$ 2>/dev/null || true
+        exit 130
     fi
     echo "$input"
 }
@@ -561,7 +567,12 @@ ask_choice() {
     local prompt="$1"; shift
     local options=("$@")
 
-    if [[ -w /dev/tty ]]; then
+    local has_tty=false
+    if [[ -t 0 && -w /dev/tty ]]; then
+        has_tty=true
+    fi
+
+    if [[ "$has_tty" == "true" ]]; then
         echo -e "${CYAN}?${NC} $prompt" >/dev/tty
         local i
         for i in "${!options[@]}"; do
@@ -583,7 +594,7 @@ ask_choice() {
             echo "${options[$((choice-1))]}"
             return
         fi
-        if [[ -w /dev/tty ]]; then
+        if [[ "$has_tty" == "true" ]]; then
             echo -e "  ${RED}Invalid choice, try again.${NC}" >/dev/tty
         else
             echo -e "  ${RED}Invalid choice, try again.${NC}" >&2
@@ -655,7 +666,24 @@ cleanup() {
     find /tmp -maxdepth 1 -name "_archiver_resp_*" -type f -mmin +60 -exec rm -f {} + 2>/dev/null || true
     release_lock
 }
-trap cleanup EXIT INT TERM
+
+on_interrupt() {
+    trap - INT TERM EXIT
+    cleanup
+    echo -e "\n${YELLOW}[CANCELLED] Operation aborted by user.${NC}" >&2
+    exit 130
+}
+
+on_term() {
+    trap - INT TERM EXIT
+    cleanup
+    echo -e "\n${YELLOW}[TERMINATED] Process terminated.${NC}" >&2
+    exit 143
+}
+
+trap cleanup EXIT
+trap on_interrupt INT
+trap on_term TERM
 
 # ============================================================
 #  SPLIT / CHUNKING

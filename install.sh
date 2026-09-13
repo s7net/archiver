@@ -120,7 +120,11 @@ if [[ "$IS_UPDATE" == "true" ]]; then
 
     # If interactive and not auto-confirmed via -y, give user prompt with default YES
     if [[ "$AUTO_YES" != "true" && -t 0 && -c /dev/tty ]]; then
-        read -rp "$(echo -e "${CYAN}?${NC} Update to the latest version? [Y/n]: ")" _confirm </dev/tty || _confirm="y"
+        if ! read -rp "$(echo -e "${CYAN}?${NC} Update to the latest version? [Y/n]: ")" _confirm </dev/tty; then
+            echo -e "\n${YELLOW}Cancelled by user.${NC}"
+            exit 130
+        fi
+        _confirm="${_confirm:-y}"
         if [[ "$_confirm" =~ ^[Nn]$ ]]; then
             echo "Cancelled by user. No changes made."
             exit 0
@@ -183,7 +187,14 @@ TMP_DEST="${INSTALL_DIR}/.${SCRIPT_NAME}.tmp.$$$RANDOM"
 cleanup_staging() {
     rm -f "$TMP_DEST" 2>/dev/null || true
 }
-trap cleanup_staging EXIT INT TERM
+on_install_interrupt() {
+    trap - INT TERM EXIT
+    cleanup_staging
+    echo -e "\n${YELLOW}[CANCELLED] Installation cancelled by user.${NC}" >&2
+    exit 130
+}
+trap cleanup_staging EXIT
+trap on_install_interrupt INT TERM
 
 _download_or_copy() {
     local target="$1"
