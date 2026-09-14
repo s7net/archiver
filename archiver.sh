@@ -7,7 +7,7 @@
 
 set -uo pipefail
 
-ARCHIVER_VERSION="1.0.2"
+ARCHIVER_VERSION="1.0.3"
 
 ARCHIVER_HOME="${ARCHIVER_HOME:-$HOME/.archiver}"
 CONFIGS_DIR="${ARCHIVER_HOME}/configs"
