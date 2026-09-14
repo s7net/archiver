@@ -7,7 +7,7 @@
 
 set -uo pipefail
 
-ARCHIVER_VERSION="1.0.3"
+ARCHIVER_VERSION="1.0.4"
 
 ARCHIVER_HOME="${ARCHIVER_HOME:-$HOME/.archiver}"
 CONFIGS_DIR="${ARCHIVER_HOME}/configs"
@@ -751,22 +751,39 @@ LOCK_FD=""
 LOCK_HELD=0
 
 acquire_lock() {
+    local profile="${1:-}"
+    local lock_name="archiver.lock"
+    if [[ -n "$profile" ]]; then
+        local safe_p
+        safe_p=$(echo "$profile" | tr -c 'a-zA-Z0-9_-' '_')
+        lock_name="archiver_${safe_p}.lock"
+    fi
+    LOCK_FILE="${LOCK_DIR}/${lock_name}"
+
     if command -v flock &>/dev/null; then
         exec {LOCK_FD}>"$LOCK_FILE"
-        if ! flock -n "$LOCK_FD"; then
-            log_error "Another archiver instance is already running (flock). Exiting."
+        # Wait up to 180 seconds if another instance is running, instead of dropping the backup
+        if ! flock -w 180 "$LOCK_FD"; then
+            log_error "Another archiver instance is already running (${lock_name}). Timeout waiting for lock."
             exit 1
         fi
         LOCK_HELD=1
     else
-        if [[ -f "$LOCK_FILE" ]]; then
+        local waited=0
+        while [[ -f "$LOCK_FILE" ]]; do
             local old_pid
             old_pid=$(cat "$LOCK_FILE" 2>/dev/null || echo "")
             if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
-                log_error "Another archiver instance is already running (PID $old_pid). Exiting."
-                exit 1
+                if (( waited >= 180 )); then
+                    log_error "Another archiver instance is already running (PID $old_pid, ${lock_name}). Exiting."
+                    exit 1
+                fi
+                sleep 2
+                (( waited += 2 )) || true
+            else
+                break
             fi
-        fi
+        done
         echo $$ > "$LOCK_FILE"
         LOCK_HELD=1
     fi
@@ -778,7 +795,7 @@ release_lock() {
             flock -u "$LOCK_FD" 2>/dev/null || true
             exec {LOCK_FD}>&- 2>/dev/null || true
         else
-            rm -f "$LOCK_FILE"
+            [[ -n "${LOCK_FILE:-}" ]] && rm -f "$LOCK_FILE" 2>/dev/null || true
         fi
         LOCK_HELD=0
     fi
@@ -2493,7 +2510,7 @@ cmd_run() {
     fi
 
     if [[ "$dry_run" == "false" ]]; then
-        acquire_lock
+        acquire_lock "$only_profile"
     fi
 
     log_info "===== archiver run started (${#configs[@]} config(s)) dry_run=$dry_run ====="
