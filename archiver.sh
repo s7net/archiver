@@ -69,10 +69,13 @@ rotate_log() {
             if [[ -e "${rotated[0]:-}" ]]; then
                 local count=${#rotated[@]}
                 if (( count > 5 )); then
+                    local tmp_log_s="${BACKUP_TMP}/_log_rot_$$.tmp"
+                    ls -1t "${LOG_DIR}"/archiver.log.* > "$tmp_log_s" 2>/dev/null || true
                     local sorted=()
                     while IFS= read -r line; do
-                        sorted+=("$line")
-                    done < <(ls -1t "${LOG_DIR}"/archiver.log.* 2>/dev/null)
+                        [[ -n "$line" ]] && sorted+=("$line")
+                    done < "$tmp_log_s"
+                    rm -f "$tmp_log_s"
                     local i
                     for (( i=5; i<${#sorted[@]}; i++ )); do
                         rm -f "${sorted[$i]}"
@@ -1057,9 +1060,12 @@ apply_retention() {
     # Group split chunks (.part*) under the base backup archive
     local unique_backups=()
     if (( ${#valid_files[@]} > 0 )); then
+        local tmp_ret_u="${BACKUP_TMP}/_ret_u_$$.tmp"
+        printf '%s\n' "${valid_files[@]}" | sed -E 's/\.part[0-9]+$//' | sort -u > "$tmp_ret_u"
         while IFS= read -r line; do
             [[ -n "$line" ]] && unique_backups+=("$line")
-        done < <(printf '%s\n' "${valid_files[@]}" | sed -E 's/\.part[0-9]+$//' | sort -u)
+        done < "$tmp_ret_u"
+        rm -f "$tmp_ret_u"
     fi
 
     # Key each unique backup for accurate chronological sorting:
@@ -1086,9 +1092,12 @@ apply_retention() {
     # Sort descending (newest first)
     local sorted=()
     if (( ${#keyed_backups[@]} > 0 )); then
+        local tmp_ret_s="${BACKUP_TMP}/_ret_s_$$.tmp"
+        printf '%s\n' "${keyed_backups[@]}" | sort -t'#' -k1,1 -r > "$tmp_ret_s"
         while IFS= read -r line; do
             [[ -n "$line" ]] && sorted+=( "${line#*###}" )
-        done < <(printf '%s\n' "${keyed_backups[@]}" | sort -t'#' -k1,1 -r)
+        done < "$tmp_ret_s"
+        rm -f "$tmp_ret_s"
     fi
 
     local total=${#sorted[@]}
@@ -2665,10 +2674,9 @@ _restore_process() {
         dir=$(dirname "$current")
         echo "Merging chunks for $stem ..."
         local merged="$work_dir/$stem"
-        local parts=()
-        while IFS= read -r p; do
-            parts+=("$p")
-        done < <(ls -1 "$dir/${stem}".part* 2>/dev/null | sort)
+        shopt -s nullglob
+        local parts=( "$dir/${stem}".part* )
+        shopt -u nullglob
         if [[ ${#parts[@]} -eq 0 ]]; then
             log_error "No chunk parts found for $stem"
             rm -rf "$work_dir"
@@ -2715,9 +2723,10 @@ _restore_process() {
         echo "------------------------"
     fi
 
-    local sql_files=() sqlite_files=()
-    while IFS= read -r f; do sql_files+=("$f"); done < <(ls -1 "$extract_dir"/*.sql 2>/dev/null || true)
-    while IFS= read -r f; do sqlite_files+=("$f"); done < <(ls -1 "$extract_dir"/*.sqlite 2>/dev/null || true)
+    shopt -s nullglob
+    local sql_files=( "$extract_dir"/*.sql )
+    local sqlite_files=( "$extract_dir"/*.sqlite )
+    shopt -u nullglob
 
     if [[ ${#sql_files[@]} -gt 0 && -f "${sql_files[0]}" ]]; then
         local is_postgres=false
